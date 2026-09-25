@@ -30,6 +30,8 @@ from claude_agent_sdk import (
     get_session_info,
 )
 
+from .config import PERMISSION_MODES
+
 log = logging.getLogger("cc.claude")
 
 # AUTO_ALLOW_TOOLS deliberately bypass the Telegram prompt; the SDK warns about that on every run.
@@ -158,6 +160,17 @@ class ClaudeTurn:
             return self._client._transport._process.pid  # type: ignore[union-attr]
         except AttributeError:
             return None
+
+    async def set_mode(self, mode: str) -> bool:
+        """Switch the permission mode of the running process (takes effect for the next tool call)."""
+        if mode not in PERMISSION_MODES or self._client is None:
+            return False
+        try:
+            await asyncio.wait_for(self._client.set_permission_mode(mode), 10)
+            return True
+        except Exception as e:  # noqa: BLE001 - the next run starts in the new mode anyway
+            log.warning("set_permission_mode failed: %s", type(e).__name__)
+            return False
 
     async def stop(self) -> None:
         """Interrupt the current turn. History stays intact (verified: resume works after)."""

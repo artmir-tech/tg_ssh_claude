@@ -157,6 +157,10 @@ class Registry:
             self.conn.execute("ALTER TABLE sessions ADD COLUMN control_msg_id INTEGER")
         if "send_files" not in cols:       # added in v0.1.2
             self.conn.execute("ALTER TABLE sessions ADD COLUMN send_files INTEGER NOT NULL DEFAULT 1")
+        if self.kv_get("perm_mode_follow") is None:   # v0.1.3: '' = follow PERMISSION_MODE from .env
+            # before v0.1.3 every session got 'default' automatically (nobody chose it) -> follow the setting
+            self.conn.execute("UPDATE sessions SET permission_mode='' WHERE permission_mode='default'")
+            self.kv_set("perm_mode_follow", 1)
         path.chmod(0o600)
 
     def close(self) -> None:
@@ -203,8 +207,8 @@ class Registry:
         now = time.time()
         cur = self.conn.execute(
             """INSERT INTO sessions(chat_id, topic_id, claude_session_id, title, title_source, cwd, status,
-                                    started, origin, model, created_at, updated_at, last_activity_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    started, origin, model, permission_mode, created_at, updated_at, last_activity_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,'',?,?,?)""",
             (chat_id, topic_id, claude_session_id, title, title_source, cwd, status, int(started), origin,
              model, now, now, now),
         )

@@ -34,6 +34,19 @@ def _list(raw: str) -> list[str]:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
+# Permission modes a session may use. bypassPermissions / dontAsk are never allowed.
+#   auto        - Claude Code's classifier approves safe actions and blocks risky ones (as in VS Code «Auto»);
+#                 works on Opus/Sonnet; on models without it (Haiku) Claude Code simply asks as usual
+#   acceptEdits - file edits in the working folder without asking, commands are asked
+#   default     - ask for every command and edit
+PERMISSION_MODES = ("auto", "acceptEdits", "default")
+
+
+def safe_mode(value: str | None) -> str:
+    value = (value or "").strip()
+    return value if value in PERMISSION_MODES else "default"
+
+
 @dataclass
 class Config:
     bot_token: str
@@ -45,6 +58,7 @@ class Config:
     claude_cli: str = "/usr/bin/claude"
     model: str | None = None            # None = whatever ~/.claude/settings.json says
     auto_allow_tools: list[str] = field(default_factory=lambda: ["WebSearch", "WebFetch"])
+    permission_mode: str = "auto"       # default for sessions: auto | acceptEdits | default (see PERMISSION_MODES)
     permission_timeout_s: int = 3600
     max_run_hours: float = 8.0
     data_dir: Path = ROOT / "data"
@@ -93,6 +107,7 @@ def load_config(env_file: Path | None = None) -> Config:
         claude_cli=get("CLAUDE_CLI", "/usr/bin/claude"),
         model=get("CLAUDE_MODEL") or None,
         auto_allow_tools=_list(get("AUTO_ALLOW_TOOLS", "WebSearch,WebFetch")),
+        permission_mode=safe_mode(get("PERMISSION_MODE", "auto")),
         permission_timeout_s=int(get("PERMISSION_TIMEOUT_MIN", "60")) * 60,
         max_run_hours=float(get("MAX_RUN_HOURS", "8")),
         data_dir=Path(get("DATA_DIR", str(ROOT / "data"))),

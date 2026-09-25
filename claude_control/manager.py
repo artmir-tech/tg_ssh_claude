@@ -10,6 +10,7 @@ The Telegram side (bot.py) is reached only through the `ui` object.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -26,7 +27,7 @@ from claude_agent_sdk import fork_session, get_session_info, rename_session
 from . import db as D
 from .claude import (ClaudeTurn, TurnOutcome, build_permission_result, grants_from_suggestions, live_sessions,
                      transcript_exists)
-from .config import Config
+from .config import PERMISSION_MODES, Config, safe_mode
 from .files import SERVER_NAME, SEND_TOOL, auto_sendable, is_secret, resolve, send_tool_server
 
 log = logging.getLogger("cc.manager")
@@ -182,11 +183,26 @@ class Manager:
         ar.task = asyncio.create_task(self._run(ar, turn), name=f"run-{turn.session_id}")
 
     # ---- one run ---------------------------------------------------------------------------
+    def session_mode(self, s: D.Session) -> str:
+        """Permission mode a run of this session uses. Never bypassPermissions, whatever is stored."""
+        mode = safe_mode(s.permission_mode or self.cfg.permission_mode)
+        if mode == "default":   # «allow edits in this topic» from a request upgrades ask-everything only
+            mode = next((g["mode"] for g in reversed(s.grant_list) if g.get("mode") in PERMISSION_MODES), mode)
+        return mode
+
+    async def set_session_mode(self, session_id: int, mode: str) -> None:
+        """Owner's choice for a topic; a running task switches at once, not only from the next message."""
+        s = self.db.get_session(session_id)
+        grants = [g for g in s.grant_list if "mode" not in g]   # an explicit choice replaces «allow edits here»
+        self.db.update_session(session_id, permission_mode=safe_mode(mode), grants=json.dumps(grants, ensure_ascii=False))
+        ar = self.active.get(session_id)
+        if ar and ar.claude:
+            await ar.claude.set_mode(self.session_mode(self.db.get_session(session_id)))
+        log.info("permission mode session=%s -> %s", session_id, safe_mode(mode))
+
     def _claude_options(self, s: D.Session) -> dict[str, Any]:
         grants = s.grant_list
-        mode = next((g["mode"] for g in reversed(grants) if "mode" in g), s.permission_mode)
-        if mode == "bypassPermissions":  # never, whatever is stored
-            mode = "default"
+        mode = self.session_mode(s)
         deny = []
         for p in self.cfg.secret_paths:
             deny += [f"Read(/{p})", f"Edit(/{p})", f"Write(/{p})"]
@@ -291,9 +307,19 @@ class Manager:
     # ---- files -----------------------------------------------------------------------------
     def _file_sender(self, ar: ActiveRun):
         async def send(path: str, caption: str) -> str:   # the send_file tool (runs inside this process)
+            s = self.db.get_session(ar.session_id)
+            p = resolve(path, s.cwd)
+            if not is_secret(p) and not self._in_session_dirs(s, p):
+                # a file from elsewhere on the server: the owner decides - in every permission mode, Auto included
+                verdict = await self._ask_owner(ar, SEND_TOOL, {"path": path, "caption": caption}, None)
+                if isinstance(verdict, PermissionResultDeny):
+                    return "Not sent: " + (verdict.message or "the owner declined.")
             return await self.ui.send_files(self.db.get_session(ar.session_id), [path], caption=caption,
                                             ar=ar, requested=True)
         return send
+
+    def _in_session_dirs(self, s: D.Session, p: Path) -> bool:
+        return p.is_relative_to(Path(s.cwd).resolve()) or p.is_relative_to(self.inbox_dir(s).resolve())
 
     async def _flush_files(self, ar: ActiveRun) -> None:
         """Send files Claude wrote with the Write tool during this run (final versions)."""
@@ -341,32 +367,40 @@ class Manager:
                 if is_secret(path):
                     return PermissionResultDeny(message="This file holds secrets (keys, tokens, logins) and is "
                                                         "never sent out of the server.")
-                if path.is_relative_to(Path(s.cwd).resolve()) or path.is_relative_to(self.inbox_dir(s).resolve()):
-                    return PermissionResultAllow()
-                # anywhere else: the owner decides with the usual buttons
-            req = PendingRequest(id=secrets.token_hex(4), session_id=ar.session_id, kind="perm",
-                                 tool_name=tool_name, input=inp, ctx=ctx,
-                                 future=asyncio.get_running_loop().create_future())
-            self.requests[req.id] = req
-            ar.waiting = "approval"
-            self.set_status(ar.session_id, D.WAITING_APPROVAL)
-            log.info("permission requested session=%s tool=%s req=%s", ar.session_id, tool_name, req.id)
-            try:
-                await self.ui.permission_request(self.db.get_session(ar.session_id), req)
-                decision, message = await asyncio.wait_for(req.future, self.cfg.permission_timeout_s)
-            except asyncio.TimeoutError:
-                decision, message = "deny", "The user did not answer in time; the action was not performed."
-                await self.ui.request_expired(req)
-            finally:
-                self.requests.pop(req.id, None)
-                ar.waiting = None
-                if ar.session_id in self.active:
-                    self.set_status(ar.session_id, D.RUNNING)
-            if decision == "session":
-                self._save_grants(ar.session_id, grants_from_suggestions(ctx))
-            log.info("permission %s session=%s tool=%s", decision, ar.session_id, tool_name)
-            return build_permission_result(decision, ctx, message)
+                return PermissionResultAllow()   # files from elsewhere: the tool itself asks the owner (_file_sender)
+            return await self._ask_owner(ar, tool_name, inp, ctx)
         return can_use_tool
+
+    async def _ask_owner(self, ar: ActiveRun, tool_name: str, inp: dict, ctx: ToolPermissionContext | None):
+        """«🔐 Claude хочет …» with buttons; waits for the owner's decision."""
+        if ctx and self.session_mode(self.db.get_session(ar.session_id)) == "auto":
+            # «allow edits here» would switch an Auto task down to acceptEdits - offer only the other suggestions
+            ctx = dataclasses.replace(ctx, suggestions=[x for x in ctx.suggestions if x.type != "setMode"])
+        req = PendingRequest(id=secrets.token_hex(4), session_id=ar.session_id, kind="perm",
+                             tool_name=tool_name, input=inp, ctx=ctx,
+                             future=asyncio.get_running_loop().create_future())
+        self.requests[req.id] = req
+        ar.waiting = "approval"
+        self.set_status(ar.session_id, D.WAITING_APPROVAL)
+        log.info("permission requested session=%s tool=%s req=%s", ar.session_id, tool_name, req.id)
+        try:
+            await self.ui.permission_request(self.db.get_session(ar.session_id), req)
+            decision, message = await asyncio.wait_for(req.future, self.cfg.permission_timeout_s)
+        except asyncio.TimeoutError:
+            decision, message = "deny", "The user did not answer in time; the action was not performed."
+            await self.ui.request_expired(req)
+        finally:
+            self.requests.pop(req.id, None)
+            ar.waiting = None
+            if ar.session_id in self.active:
+                self.set_status(ar.session_id, D.RUNNING)
+        if decision == "session":
+            self._save_grants(ar.session_id, grants_from_suggestions(ctx))
+        if decision == "auto":   # «allow and switch this topic to Auto»
+            await self.set_session_mode(ar.session_id, "auto")
+            decision = "once"
+        log.info("permission %s session=%s tool=%s", decision, ar.session_id, tool_name)
+        return build_permission_result(decision, ctx, message)
 
     def _save_grants(self, session_id: int, new: list[dict]) -> None:
         s = self.db.get_session(session_id)

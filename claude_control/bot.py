@@ -24,7 +24,7 @@ from claude_agent_sdk import get_session_info, get_session_messages, list_sessio
 from . import __version__
 from . import db as D
 from .claude import ENTRYPOINT, TurnOutcome, live_sessions
-from .config import Config
+from .config import Config, safe_mode
 from .manager import ActiveRun, Manager, PendingRequest
 from .render import (TG_LIMIT, ago, clip, clip_words, clock, duration, esc, folder_label, md_to_html, ordinal, plural,
                      precise_duration, short_path, short_when,
@@ -89,6 +89,12 @@ TOPIC_HELP = """<b>Эта тема — сессия Claude</b>
 
 MODEL_TEXT = ("🧠 <b>Модель для этой темы</b>\n\n<b>Opus</b> — самая сильная, быстрее тратит лимит\n"
               "<b>Sonnet</b> — быстрее, хватает для большинства задач\n<b>Haiku</b> — самая быстрая, для простого")
+MODE_LABEL = {"auto": "🤖 Авто", "acceptEdits": "✏️ Правки без вопросов", "default": "🔐 Спрашивать всё"}
+MODE_TEXT = ("🛡 <b>Разрешения в этой теме</b>\n\n"
+             "<b>🤖 Авто</b> — как режим Auto в VS Code: обычную работу Claude делает сам, рискованное "
+             "(удаление, отправка данных наружу, секреты, чужие системы) проверка блокирует или спрашивает вас\n"
+             "<b>✏️ Правки без вопросов</b> — файлы в рабочей папке правит сам, про команды спрашивает\n"
+             "<b>🔐 Спрашивать всё</b> — кнопки «Разрешить» на каждую команду и правку")
 INTERRUPTED_TEXT = "⚠️ Бот перезапускался, и этот запрос прервался на середине.\nИстория сохранена."
 
 ALL_COMMANDS = """<b>Все команды</b>
@@ -107,6 +113,7 @@ ALL_COMMANDS = """<b>Все команды</b>
 /fork — копия разговора в новой теме
 /archive, /unarchive — убрать в архив и вернуть
 /model — модель Claude
+/mode — разрешения: Авто / правки без вопросов / спрашивать всё
 /restart — заново выполнить последний запрос
 /project — папка (только до первого сообщения)"""
 
@@ -1063,6 +1070,9 @@ class Bot:
         elif cmd == "model":
             text, buttons = self.panel_view(s, "model")
             await reply(text, buttons=buttons)
+        elif cmd == "mode":
+            text, buttons = self.panel_view(s, "perm")
+            await reply(text, buttons=buttons)
         else:
             await note("Не знаю такой команды — все действия есть в закреплённой панели вверху темы.")
 
@@ -1092,6 +1102,7 @@ class Bot:
         model = s.model.capitalize() if s.model else (self.cfg.model or f"как в Claude Code ({default_model_label()})")
         lines += ["", f"Запросов выполнено: {self.db.count_turns(s.id)} · {origin} {when(s.created_at)}",
                   f"Модель: {esc(model)} · папка: {esc(folder_label(s.cwd))}"]
+        lines.append("🛡 Разрешения: " + self.mode_label(s))
         lines.append("📎 Файлы, которые делает Claude: " + ("приходят сюда сами" if s.send_files else "не присылаются "
                                                             "(можно попросить «пришли файл»)"))
         if s.grant_list:
@@ -1102,6 +1113,17 @@ class Bot:
         return "\n".join(lines)
 
     # ---- the pinned control panel of a topic -------------------------------------------------
+    def auto_works(self, s: D.Session) -> bool:
+        """Claude Code's Auto mode exists for Opus/Sonnet; with Haiku it silently falls back to asking."""
+        return "haiku" not in (s.model or self.cfg.model or default_model_label()).lower()
+
+    def mode_label(self, s: D.Session) -> str:
+        mode = self.m.session_mode(s)
+        text = MODE_LABEL[mode]
+        if mode == "auto" and not self.auto_works(s):
+            text += " (у Haiku нет Авто — Claude спрашивает)"
+        return text
+
     def panel_view(self, s: D.Session, view: str = "main") -> tuple[str, list[list[dict]]]:
         """Screens of the pinned panel. Every sub-screen has «◂ Назад»; irreversible actions ask first."""
         back = [btn("◂ Назад", f"pv:{s.id}:main")]
@@ -1114,6 +1136,12 @@ class Bot:
                                      f"pa:{s.id}:model:-")],
                                 [btn(mark("opus"), f"pa:{s.id}:model:opus"), btn(mark("sonnet"), f"pa:{s.id}:model:sonnet"),
                                  btn(mark("haiku"), f"pa:{s.id}:model:haiku")], back]
+        if view == "perm":
+            cur = self.m.session_mode(s)
+            text = MODE_TEXT + ("\n\n⚠️ <i>Сейчас выбрана модель Haiku — у неё нет режима Авто, Claude будет "
+                                "спрашивать. Для Авто выберите Opus или Sonnet (🧠 Модель).</i>" if not self.auto_works(s) else "")
+            return text, [[btn(("✅ " if cur == m else "") + MODE_LABEL[m], f"pa:{s.id}:perm:{m}")]
+                          for m in ("auto", "acceptEdits", "default")] + [back]
         if view == "folder":
             rows = [[btn(("✅ " if p == s.cwd else "") + folder_label(p).capitalize(), f"pa:{s.id}:folder:{self._path_key(p)}")]
                     for p in self.known_projects()]
@@ -1132,12 +1160,13 @@ class Bot:
         elif not s.started and s.id not in self.m.active:
             lines.append("👋 Напишите задание обычным сообщением — я начну.")
         model = s.model.capitalize() if s.model else (self.cfg.model or default_model_label())
-        lines += [f"🧠 {esc(model)} · 📁 {esc(folder_label(s.cwd))}",
+        lines += [f"🧠 {esc(model)} · 📁 {esc(folder_label(s.cwd))} · {MODE_LABEL[self.m.session_mode(s)]}",
                   "<i>Закреплено — нажмите на полоску вверху темы, чтобы вернуться сюда.</i>"]
         rows = [[btn("ℹ️ О сессии", f"pv:{s.id}:info"), btn("⏹ Остановить", f"stop:{s.id}")],
                 [btn("🧠 Модель", f"pv:{s.id}:model"), btn("✏️ Переименовать", f"pa:{s.id}:ren")],
                 [btn("🌿 Ветка", f"pv:{s.id}:fork"),
                  btn("📤 Вернуть из архива", f"pa:{s.id}:unarch") if s.archived else btn("🗄 В архив", f"pv:{s.id}:arch")]]
+        rows.append([btn("🛡 Разрешения: " + MODE_LABEL[self.m.session_mode(s)], f"pv:{s.id}:perm")])
         rows.append([btn("📎 Файлы от Claude: " + ("присылать ✅" if s.send_files else "не присылать"),
                          f"pa:{s.id}:files")])
         last = [btn("❔ Все команды", f"pv:{s.id}:help")]
@@ -1559,6 +1588,8 @@ class Bot:
         buttons = [[btn("✅ Разрешить", f"perm:{req.id}:o"), btn("❌ Запретить", f"perm:{req.id}:d")]]
         if req.ctx and req.ctx.suggestions:
             buttons.append([btn("♾ " + self._rule_label(req.ctx), f"perm:{req.id}:s")])
+        if self.m.session_mode(s) != "auto" and self.auto_works(s):
+            buttons.append([btn("🤖 Разрешить и включить Авто в теме", f"perm:{req.id}:a")])
         msg = await self._send_topic(s, text, buttons=buttons)
         req.message_id = msg["message_id"] if msg else None
 
@@ -1652,7 +1683,7 @@ class Bot:
             return "Чищу General — займёт пару минут"
         if action == "perm":
             rid, _, choice = rest.partition(":")
-            decision = {"o": "once", "s": "session", "d": "deny"}.get(choice, "deny")
+            decision = {"o": "once", "s": "session", "d": "deny", "a": "auto"}.get(choice, "deny")
             pending = self.m.requests.get(rid)
             req_mid, shown = (pending.message_id, pending.text) if pending else (None, "")
             req = self.m.resolve(rid, decision)
@@ -1660,9 +1691,11 @@ class Bot:
                 await self._safe_edit_markup(msg)
                 return "Запрос уже неактуален"
             verdict = {"once": "✅ <b>Разрешено</b>", "deny": "❌ <b>Запрещено</b>",
-                       "session": f"♾ <b>Разрешено</b>, дальше без вопросов: {esc(grant_label_from(req))}"}[decision]
+                       "session": f"♾ <b>Разрешено</b>, дальше без вопросов: {esc(grant_label_from(req))}",
+                       "auto": "🤖 <b>Разрешено</b>, в теме включён режим Авто"}[decision]
             await self._close(req_mid, shown, f"{verdict} · {clock()}")
-            return {"once": "Разрешено", "session": "Разрешено", "deny": "Запрещено"}[decision]
+            return {"once": "Разрешено", "session": "Разрешено", "deny": "Запрещено",
+                    "auto": "Разрешено, дальше — режим Авто"}[decision]
         if action == "ask":
             return await self._on_ask_button(rest, msg)
         if action == "imp":
@@ -1750,6 +1783,10 @@ class Bot:
         if what == "ren":
             await self.ask_new_title(s, mid)
             return "Напишите новое название сообщением"
+        if what == "perm":
+            await self.m.set_session_mode(s.id, arg)
+            await self.show_panel(self.db.get_session(s.id), "main", mid)
+            return "Разрешения: " + MODE_LABEL[safe_mode(arg)].split(" ", 1)[1]
         if what == "files":
             self.db.update_session(s.id, send_files=0 if s.send_files else 1)
             await self.show_panel(s, "main", mid)
@@ -1889,7 +1926,8 @@ class Bot:
                  f"Сессий: {len(all_s)} (в архиве: {sum(s.archived for s in all_s)})",
                  f"База: <code>{esc(str(self.cfg.db_path))}</code> ({self.cfg.db_path.stat().st_size // 1024} КБ)",
                  f"Папка по умолчанию: <code>{esc(self.m.default_cwd())}</code> · часовой пояс: {tz_name()}",
-                 f"Без подтверждения: {esc(', '.join(self.cfg.auto_allow_tools) or 'ничего')} + чтение файлов",
+                 f"Разрешения по умолчанию: {MODE_LABEL[self.cfg.permission_mode]} · всегда без вопросов: "
+                 f"{esc(', '.join(self.cfg.auto_allow_tools) or 'ничего')} + чтение файлов",
                  "Голос: " + ("выключен" if not self.voice else "GigaAM v3 — " + (
                      "модель загружена" if self.voice.proc and self.voice.proc.returncode is None else "загрузится по первому голосовому"))]
         if self.m.active:

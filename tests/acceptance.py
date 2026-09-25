@@ -26,7 +26,7 @@ from claude_agent_sdk import delete_session, get_session_info, get_session_messa
 from claude_control import db as D
 from claude_control.bot import Bot
 from claude_control.config import Config
-from claude_control.manager import Manager
+from claude_control.manager import ActiveRun, Manager
 from tests.fake_telegram import FakeTelegram
 
 OWNER, STRANGER, CHAT = 111111111, 999000111, -1001234567890
@@ -47,7 +47,7 @@ class Harness:
         self.data_dir = data_dir
         self.cfg = Config(bot_token="123:FAKE-TOKEN", owner_ids={OWNER}, chat_id=CHAT, max_concurrent=max_concurrent,
                           default_cwd=str(WORK), project_dirs=[str(WORK)], model="haiku", data_dir=data_dir,
-                          permission_timeout_s=300,
+                          permission_timeout_s=300, permission_mode="default",
                           voice_engine="gigaam" if (ROOT.parent / ".venv-voice/bin/python").exists() else "")
         self.db = D.Registry(self.cfg.db_path)
         self.tg = FakeTelegram()
@@ -774,6 +774,86 @@ async def t19_files(h: Harness, ctx: dict) -> str:
     return "written file arrives by itself; send_file works; .env blocked; switch off works; album = 1 task; zip; size limit"
 
 
+async def t20_permission_modes(h: Harness, ctx: dict) -> str:
+    # sessions from before v0.1.3 got 'default' automatically (nobody chose it) -> they follow PERMISSION_MODE
+    legacy_path = h.data_dir / "legacy.db"
+    reg = D.Registry(legacy_path)
+    old = reg.create_session(chat_id=CHAT, topic_id=1, claude_session_id="legacy", title="old", cwd=str(WORK))
+    reg.conn.execute("UPDATE sessions SET permission_mode='default'")
+    reg.conn.execute("DELETE FROM kv WHERE key='perm_mode_follow'")
+    reg.close()
+    reg = D.Registry(legacy_path)
+    check(reg.get_session(old.id).permission_mode == "", "legacy sessions switch to the .env default")
+    reg.close()
+
+    h.cfg.permission_mode = "auto"   # as in production
+    h.auto_approve = False
+    files = [WORK / "auto-dir", WORK / "m1.txt", WORK / "m2.txt"]
+    try:
+        topic = await h.new_topic("Test M — modes")
+        s = h.m.create_session(CHAT, topic, "Test M — modes", cwd=str(WORK))
+        CREATED_SESSIONS.add(s.claude_session_id)
+        await h.press(f"pv:{s.id}:perm", thread=topic)
+        e = h.tg.edits[-1]
+        labels = [b["text"] for r in e["buttons"] for b in r]
+        check("✅ 🤖 Авто" in labels and len(labels) == 4, f"picker: 3 modes + «Назад», Auto by default: {labels}")
+        check("нет режима Авто" in e["text"], "with Haiku the picker warns that Auto is not available")
+        check("🤖 Авто" in h.bot.panel_view(h.session(topic))[0], "the panel header shows the mode")
+
+        h.db.update_session(s.id, model="sonnet")   # Auto mode needs Opus/Sonnet
+        await h.say(topic, "Use the Bash tool to run: mkdir -p auto-dir && echo ok > auto-dir/f.txt . "
+                           "Then reply exactly: DONE")
+        turn = await h.wait_idle(topic, 240)
+        check(turn.status == "done" and (WORK / "auto-dir/f.txt").exists(), f"auto: command ran ({turn.status})")
+        check(not [m for m in h.tg.in_topic(topic) if m["text"].startswith("🔐")], "auto: no permission request")
+        outside = Path(tempfile.mkdtemp(prefix="cc-outside-")) / "notes.txt"   # not in the session folder
+        outside.write_text("server notes")
+        try:
+            # the send_file tool itself asks before a file from elsewhere leaves - in Auto too
+            # (called directly: Sonnet in Auto usually declines such a request on its own)
+            sender = h.m._file_sender(ActiveRun(session_id=s.id, turn_id=0, status_msg_id=None))
+            job = asyncio.create_task(sender(str(outside), ""))
+            await h.wait(lambda: any(m["text"].startswith("🔐") for m in h.tg.in_topic(topic)), 20, "send_file request")
+            req = [m for m in h.tg.in_topic(topic) if m["text"].startswith("🔐")][-1]
+            check("notes.txt" in req["text"], f"Auto still asks before sending a file from elsewhere: {req['text'][:80]!r}")
+            deny = next(b["callback_data"] for r in req["buttons"] for b in r if b["callback_data"].endswith(":d"))
+            await h.press(deny, thread=topic)
+            result = await asyncio.wait_for(job, 20)
+            check(result.startswith("Not sent") and "notes.txt" not in [f for m in h.tg.in_topic(topic)
+                                                                        for f in m.get("files", [])], f"denied: {result}")
+            h.m.set_status(s.id, D.IDLE)
+        finally:
+            shutil.rmtree(outside.parent, ignore_errors=True)
+
+        await h.press(f"pa:{s.id}:perm:default", thread=topic)
+        check(h.session(topic).permission_mode == "default", "owner switched the topic to «ask everything»")
+        await h.say(topic, "Step 1: use the Bash tool to run: touch m1.txt . Step 2: only after step 1 succeeded, "
+                           "use the Bash tool again to run: ls m1.txt && touch m2.txt . Then reply exactly: DONE")
+        await h.wait(lambda: h.session(topic).status == D.WAITING_APPROVAL, 120, "permission request")
+        await h.wait(lambda: len([m for m in h.tg.in_topic(topic) if m["text"].startswith("🔐")]) == 2, 30, "request sent")
+        req = [m for m in h.tg.in_topic(topic) if m["text"].startswith("🔐")][-1]
+        auto_btn = next((b["callback_data"] for r in req["buttons"] for b in r if b["callback_data"].endswith(":a")), None)
+        check(auto_btn is not None, f"the request offers «Разрешить и включить Авто»: {req['buttons']}")
+        await h.press(auto_btn, thread=topic)
+        turn = await h.wait_idle(topic, 240)
+        asks = [m for m in h.tg.in_topic(topic) if m["text"].startswith("🔐")]
+        check(turn.status == "done" and (WORK / "m1.txt").exists() and (WORK / "m2.txt").exists(),
+              f"both commands ran ({turn.status})")
+        check(len(asks) == 2, f"after «включить Авто» the running task asks no more: {len(asks) - 1} requests")
+        check(h.session(topic).permission_mode == "auto", "the topic stays in Auto")
+        closed = [x for x in h.tg.edits if x["message_id"] == req["message_id"]]
+        check(closed and "режим Авто" in closed[-1]["text"], "the verdict says Auto was switched on")
+        check("🛡 Разрешения: 🤖 Авто" in h.bot.session_card(h.session(topic)), "«О сессии» shows the mode")
+    finally:
+        h.cfg.permission_mode = "default"
+        h.auto_approve = True
+        for f in files:
+            shutil.rmtree(f, ignore_errors=True) if f.is_dir() else f.unlink(missing_ok=True)
+    return ("legacy sessions follow .env; picker with Haiku warning; Sonnet in Auto ran a command without asking, "
+            "but still asked before sending a file from outside the folder; "
+            "«Разрешить и включить Авто» switched the running task — second command not asked")
+
+
 TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T3", "isolation", t3_isolation),
          ("T4+T5", "concurrency=5 + queue", t4_t5_concurrency_and_queue),
          ("T6", "same-session serialization", t6_serialization), ("T7", "service restart", t7_restart),
@@ -786,7 +866,8 @@ TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T
          ("T16", "pinned control panel instead of commands", t16_control_panel),
          ("T17", "General stays clean (sweep, no replies, janitor)", t17_clean_general),
          ("T18", "voice message → GigaAM → Claude", t18_voice),
-         ("T19", "files: Claude → chat automatically, send_file, albums, limits", t19_files)]
+         ("T19", "files: Claude → chat automatically, send_file, albums, limits", t19_files),
+         ("T20", "permission modes: Auto by default, picker, switch from a request", t20_permission_modes)]
 
 
 async def main(selected: list[str]) -> int:
