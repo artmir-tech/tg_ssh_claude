@@ -77,6 +77,7 @@ GENERAL_HELP = """<b>Как пользоваться</b>
 1. Создайте тему → напишите задание.
 2. Одна тема = одна сессия Claude.
 3. Дашборд всегда внизу General.
+4. Написали сюда (текст, голос, файл) — выберите кнопкой, в какую тему отправить, или «🆕 Новая тема».
 
 В теме: /stop — остановить, /info — о сессии.
 Здесь: /import — сессия из VS Code."""
@@ -245,6 +246,8 @@ class Bot:
         self._live_sig: tuple = ()
         self._usage_at = 0.0
         self._flash: tuple[str, float] = ("", 0.0)
+        self._route: list[dict] = []            # messages written in General, waiting for «Куда отправить?»
+        self._route_at = 0.0
         self.voice: Transcriber | None = None
         self._albums: dict[str, dict] = {}      # media_group_id -> files collected from one Telegram album
         if cfg.voice_engine == "gigaam":
@@ -439,9 +442,70 @@ class Bot:
             await self.refresh_dashboard(view="diag")
         elif cmd:
             await self.flash("Не знаю такой команды — все действия есть на кнопках дашборда.")
+        else:   # text, voice, a file: keep it and ask which topic it is for
+            if time.time() - self._route_at > DASH_VIEW_RESET_S:
+                self._route = []
+            self._route.append(m)
+            self._route_at = time.time()
+            await self.refresh_dashboard(view="route")
+
+    def route_view(self) -> tuple[str, list[list[dict]]]:
+        """«Куда отправить?» for what the owner wrote in General: a new topic or one of the recent ones."""
+        texts = [(x.get("text") or x.get("caption") or "").strip() for x in self._route]
+        what = "\n".join(t for t in texts if t)
+        extra = []
+        if any(x.get("voice") or x.get("audio") or x.get("video_note") for x in self._route):
+            extra.append("🎙 голосовое")
+        files = sum(1 for x in self._route if any(k in x for k in ("document", "photo", "video")))
+        if files:
+            extra.append(f"📎 {plural(files, 'файл', 'файла', 'файлов')}")
+        preview = (f"«{esc(clip(what, 300))}»" if what else "") + ("\n" if what and extra else "") + " · ".join(extra)
+        lines = ["✉️ <b>Куда отправить?</b>", preview,
+                 "<i>Сообщение уйдёт в выбранную тему, как будто вы написали там.</i>"]
+        recent = sorted((s for s in self.db.sessions() if s.topic_id), key=lambda s: -(s.last_activity_at or 0))[:6]
+        rows = [[btn("🆕 Новая тема", "route:new")]]
+        rows += [[btn(f"{STATUS_VIEW.get(s.status, ('⚪', ''))[0]} {clip(s.title, 34)}", f"route:{s.id}")] for s in recent]
+        rows.append([btn("✖ Отменить", "route:x")])
+        return "\n".join(lines), rows
+
+    async def route_to(self, choice: str) -> str:
+        """Send what was written in General into a topic, exactly as if it had been written there."""
+        msgs, self._route = self._route, []
+        self.db.kv_set("dashboard_view", "main")
+        if not msgs or choice == "x":
+            await self.refresh_dashboard(view="main")
+            return "Отменено" if msgs else "Сообщение уже неактуально — напишите его ещё раз"
+        if choice == "new":
+            first = next(((x.get("text") or x.get("caption") or "").strip() for x in msgs
+                          if (x.get("text") or x.get("caption") or "").strip()), "")
+            name = clip_words(first, 40) if first else f"Новая сессия {clock()}"
+            try:
+                topic_id = await self.tg.create_topic(self.chat_id, name)
+            except TelegramError as e:
+                self._route = msgs
+                await self.flash(self._rights_hint(e))
+                return "Не получилось создать тему"
+            s = self.m.create_session(self.chat_id, topic_id, name, title_source="placeholder")  # renamed by meaning
+            await self.ensure_control_card(s)
         else:
-            await self.flash("Это общий чат-дашборд. Чтобы дать задание Claude, создайте тему "
-                             "или нажмите «➕ Новая».")
+            s = self.db.get_session(int(choice)) if choice.isdigit() else None
+            if s is None or not s.topic_id:
+                await self.refresh_dashboard(view="main")
+                return "Тема не найдена"
+            if s.archived:
+                await self.unarchive(s, quiet=True)
+                s = self.db.get_session(s.id)
+        for x in msgs:
+            text = (x.get("text") or x.get("caption") or "").strip()
+            kind = ("🎙 голосовое" if x.get("voice") or x.get("audio") or x.get("video_note")
+                    else "📎 файл" if any(k in x for k in ("document", "photo", "video")) else "")
+            echo = await self._send_topic(s, "✉️ <i>Из General:</i>\n" + (esc(text) if text else kind), silent=True)
+            moved = {k: v for k, v in x.items() if k != "reply_to_message"}
+            moved.update(message_thread_id=s.topic_id, is_topic_message=True,
+                         message_id=echo["message_id"] if echo else x["message_id"])
+            await self._topic(moved, s.topic_id, None, "", text)
+        await self.flash(f'✉️ Отправлено в <a href="{self.topic_link(s.topic_id)}">{esc(s.title)}</a>')
+        return f"Отправлено в «{clip(s.title, 40)}»"
 
     async def flash(self, html_text: str) -> None:
         """A short notice shown on top of the dashboard for a minute (instead of a message in General)."""
@@ -610,6 +674,8 @@ class Bot:
             return GENERAL_HELP, [[btn("Все команды ▸", "dash:helpall")], [back[0]]]
         if view == "helpall":
             return ALL_COMMANDS, [[btn("◂ Назад", "dash:help")]]
+        if view == "route" and self._route:
+            return self.route_view()
         return self.dashboard(view)
 
     async def refresh_dashboard(self, view: str | None = None, repost: bool = False) -> None:
@@ -1716,6 +1782,8 @@ class Bot:
                 await self.tg.delete_message(self.chat_id, mid)
                 await self.refresh_dashboard(view=view, repost=True)
             return None
+        if action == "route":   # «Куда отправить?» for a message written in General
+            return await self.route_to(rest)
         if action == "new":
             await self.new_session_topic("")
             return "Создаю новую тему…"

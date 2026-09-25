@@ -150,6 +150,14 @@ class Harness:
         return self.turns(topic)[-1]
 
 
+def dash_text(h: "Harness") -> str:
+    """What the dashboard shows now (its last edit, or the message as sent)."""
+    dash = int(h.db.kv_get("dashboard_msg_id", "0"))
+    shown = [x["text"] for x in h.tg.sent if x["message_id"] == dash] + \
+            [x["text"] for x in h.tg.edits if x["message_id"] == dash]
+    return shown[-1] if shown else ""
+
+
 def check(cond: bool, msg: str) -> None:
     if not cond:
         raise AssertionError(msg)
@@ -577,7 +585,9 @@ async def t15_live_dashboard(h: Harness, ctx: dict) -> str:
     sent_before = len(h.tg.sent)
     text_msg = await h.say(None, "привет")
     check(text_msg["message_id"] in h.tg.deleted, "a stray message in General is removed at once")
-    check(len(h.tg.sent) == sent_before and "🔔" in h.tg.edits[-1]["text"], "the hint appears inside the dashboard")
+    check(len(h.tg.sent) == sent_before and "Куда отправить" in h.tg.edits[-1]["text"],
+          "«Куда отправить?» appears inside the dashboard")
+    await h.press("route:x", message_id=int(h.db.kv_get("dashboard_msg_id")))
     loop.cancel()
     from claude_control.render import md_to_html
     from claude_control.claude import tool_summary
@@ -696,6 +706,14 @@ async def t18_voice(h: Harness, ctx: dict) -> str:
                                               "mime_type": "audio/ogg"})
         await h.update({"message": m})
         turn = await h.wait_idle(topic, 180)
+        # a voice message in General: «Куда отправить?» → the topic, then transcribed there
+        g = h._msg(None, None, OWNER, voice={"file_id": "V2", "duration": 11, "file_size": 45000, "mime_type": "audio/ogg"})
+        await h.update({"message": g})
+        dash = int(h.db.kv_get("dashboard_msg_id"))
+        check("🎙 голосовое" in dash_text(h), "General asks where to")
+        await h.press(f"route:{h.session(topic).id}", message_id=dash)
+        routed = await h.wait_idle(topic, 180)
+        check(routed.id != turn.id and "Ничьих не требуя похвал" in routed.prompt, "voice from General transcribed in the topic")
     finally:
         h.tg.download = real_download
     heard = [e["text"] for e in h.tg.edits if e["text"].startswith("🎙 <i>")]
@@ -705,7 +723,7 @@ async def t18_voice(h: Harness, ctx: dict) -> str:
     check(turn.status == "done" and h.answers(topic), f"Claude answered: {turn.status}")
     check(not list(h.m.inbox_dir(h.session(topic)).glob("voice-*")), "the recording is deleted after transcription")
     await h.bot.voice.stop()
-    return f"voice → «{heard[-1][5:60]}…» → Claude answered; recording deleted"
+    return f"voice → «{heard[-1][5:60]}…» → Claude answered; recording deleted; voice from General routed to a topic"
 
 
 async def t19_files(h: Harness, ctx: dict) -> str:
@@ -890,6 +908,41 @@ async def t20_permission_modes(h: Harness, ctx: dict) -> str:
             "update restart holds the queue and the new version runs it")
 
 
+async def t21_general_route(h: Harness, ctx: dict) -> str:
+    topic = await h.new_topic("Test R — route")
+    await h.say(topic, "Запомни слово ROUTE-9. Ответь: OK")
+    await h.wait_idle(topic)
+    s = h.session(topic)
+    n = len(h.tg.sent)
+    msg = await h.say(None, "Какое слово я просил запомнить? Ответь только им.")
+    dash = int(h.db.kv_get("dashboard_msg_id"))
+    e = [x for x in h.tg.edits if x["message_id"] == dash][-1]
+    datas = [b["callback_data"] for r in e["buttons"] for b in r]
+    check(msg["message_id"] in h.tg.deleted and not [m for m in h.tg.sent[n:] if m["thread_id"] is None],
+          "General stays clean: the message is removed, nothing new is posted there")
+    check("Куда отправить" in e["text"] and "ROUTE" not in e["text"] and "Какое слово" in e["text"]
+          and {"route:new", f"route:{s.id}", "route:x"} <= set(datas), f"the dashboard asks where: {datas}")
+    await h.press(f"route:{s.id}", message_id=dash)
+    await h.wait_idle(topic)
+    check(any(m["text"].startswith("✉️ <i>Из General") for m in h.tg.in_topic(topic)), "the topic shows what was written")
+    check("ROUTE-9" in h.answers(topic)[-1].upper(), f"it continued that conversation: {h.answers(topic)[-1]!r}")
+    check("Отправлено" in [x for x in h.tg.edits if x["message_id"] == dash][-1]["text"], "the dashboard confirms")
+
+    before = set(h.tg.topics)
+    await h.say(None, "Reply exactly: NEW-FROM-GENERAL")
+    await h.press("route:new", message_id=dash)
+    new = [t for t in h.tg.topics if t not in before]
+    check(len(new) == 1 and h.tg.topics[new[0]].startswith("Reply exactly"), f"a new topic named by the message: {new}")
+    await h.wait_idle(new[0])
+    check("NEW-FROM-GENERAL" in h.answers(new[0])[-1], "Claude got the task in the new topic")
+
+    await h.say(None, "не туда")
+    await h.press("route:x", message_id=dash)
+    check(not h.bot._route and "Куда отправить" not in [x for x in h.tg.edits if x["message_id"] == dash][-1]["text"],
+          "«Отменить» drops the message")
+    return "General message → chosen topic (continued its conversation) / new topic named by it / cancel; General stays clean"
+
+
 TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T3", "isolation", t3_isolation),
          ("T4+T5", "concurrency=5 + queue", t4_t5_concurrency_and_queue),
          ("T6", "same-session serialization", t6_serialization), ("T7", "service restart", t7_restart),
@@ -903,7 +956,8 @@ TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T
          ("T17", "General stays clean (sweep, no replies, janitor)", t17_clean_general),
          ("T18", "voice message → GigaAM → Claude", t18_voice),
          ("T19", "files: Claude → chat automatically, send_file, albums, limits", t19_files),
-         ("T20", "permission modes: Auto by default, picker, switch from a request", t20_permission_modes)]
+         ("T20", "permission modes: Auto by default, picker, switch from a request", t20_permission_modes),
+         ("T21", "message in General → «Куда отправить?» → topic", t21_general_route)]
 
 
 async def main(selected: list[str]) -> int:
