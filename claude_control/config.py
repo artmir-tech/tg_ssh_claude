@@ -52,6 +52,8 @@ class Config:
     timezone: str | None = None         # IANA name for times shown in Telegram; None = server time
     voice_engine: str = ""              # "gigaam" = transcribe voice messages (needs .venv-voice); "" = off
     voice_max_min: int = 15             # longer voice/audio is not transcribed
+    max_send_mb: int = 50               # Telegram Bot API limits (a local Bot API server allows up to 2000)
+    max_receive_mb: int = 20
 
     @property
     def db_path(self) -> Path:
@@ -98,6 +100,8 @@ def load_config(env_file: Path | None = None) -> Config:
         timezone=get("TIMEZONE") or None,
         voice_engine=get("VOICE_ENGINE").lower(),
         voice_max_min=int(get("VOICE_MAX_MIN", "15")),
+        max_send_mb=int(get("MAX_SEND_MB", "50")),
+        max_receive_mb=int(get("MAX_RECEIVE_MB", "20")),
     )
     if cfg.default_cwd not in cfg.project_dirs:
         cfg.project_dirs.insert(0, cfg.default_cwd)

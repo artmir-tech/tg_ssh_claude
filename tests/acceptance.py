@@ -708,6 +708,72 @@ async def t18_voice(h: Harness, ctx: dict) -> str:
     return f"voice → «{heard[-1][5:60]}…» → Claude answered; recording deleted"
 
 
+async def t19_files(h: Harness, ctx: dict) -> str:
+    tdir = Path.home() / f"cc-files-test-{os.getpid()}"   # outside any git repo, like a real work folder
+    tdir.mkdir(exist_ok=True)
+    try:
+        topic = await h.new_topic("Test F — files")
+        s = h.m.create_session(CHAT, topic, "Test F — files", cwd=str(tdir))
+        CREATED_SESSIONS.add(s.claude_session_id)
+        sent_files = lambda: [f for m in h.tg.in_topic(topic) for f in m.get("files", [])]  # noqa: E731
+
+        await h.say(topic, "Use the Write tool to create report.txt containing exactly: quarterly report ready. "
+                           "Then reply exactly: DONE")
+        await h.wait_idle(topic, 180)
+        check("report.txt" in sent_files(), f"a file Claude wrote arrives by itself: {sent_files()}")
+        (tdir / "existing.csv").write_text("a,b\n1,2\n")
+        await h.say(topic, "Use your send_file tool to send me the file existing.csv. Then reply exactly: SENT")
+        await h.wait_idle(topic, 180)
+        check("existing.csv" in sent_files(), f"«send me a file» works: {sent_files()}")
+        check(not [m for m in h.tg.in_topic(topic) if m["text"].startswith("🔐") and "existing.csv" in m["text"]],
+              "files from the session folder need no approval")
+        (tdir / ".env").write_text("SECRET_TOKEN=do-not-leak\n")
+        await h.say(topic, "Use your send_file tool to send me the file .env from the working folder. Reply OK after.")
+        await h.wait_idle(topic, 180)
+        check(".env" not in sent_files(), "secrets never leave the server")
+
+        await h.press(f"pa:{s.id}:files", thread=topic, message_id=h.session(topic).control_msg_id or 1)
+        check(h.session(topic).send_files == 0, "panel switch turns automatic files off")
+        await h.say(topic, "Use the Write tool to create second.txt containing: two. Then reply exactly: DONE")
+        await h.wait_idle(topic, 180)
+        check("second.txt" not in sent_files() and (tdir / "second.txt").exists(), "switched off: nothing is sent")
+        await h.press(f"pa:{s.id}:files", thread=topic, message_id=h.session(topic).control_msg_id or 1)
+
+        # an album of two photos with one caption becomes ONE task with both files
+        group = f"album-{os.getpid()}"
+        for i in range(2):
+            m = h._msg(None, topic, OWNER, media_group_id=group,
+                       photo=[{"file_id": f"P{i}", "file_size": 100, "width": 10, "height": 10}],
+                       **({"caption": "Сколько файлов я прислал? Ответь цифрой."} if i == 0 else {}))
+            await h.update({"message": m})
+        await asyncio.sleep(3)
+        turn = await h.wait_idle(topic, 180)
+        check(turn.prompt.count("photo_") == 2 and "Сколько файлов" in turn.prompt, f"album -> one task: {turn.prompt!r}")
+
+        # limits and many files (no Claude needed)
+        before = len(h.tg.sent)
+        h.cfg.max_send_mb = 0
+        result = await h.bot.send_files(h.session(topic), [str(tdir / "existing.csv")], requested=True)
+        h.cfg.max_send_mb = 50
+        check(result.startswith("Not sent") and "больше предела" in h.tg.sent[-1]["text"], f"too big: {result}")
+        many = []
+        for i in range(12):
+            (tdir / f"part{i}.txt").write_text(str(i))
+            many.append(str(tdir / f"part{i}.txt"))
+        await h.bot.send_files(h.session(topic), many)
+        check(h.tg.sent[-1].get("files") == ["files.zip"] and len(h.tg.sent) == before + 2, "12 files -> one zip")
+    finally:
+        shutil.rmtree(tdir, ignore_errors=True)
+        proj = Path.home() / ".claude/projects" / ("-" + str(tdir).strip("/").replace("/", "-"))
+        for sid in list(CREATED_SESSIONS):
+            try:
+                delete_session(sid, directory=str(tdir))
+            except Exception:  # noqa: BLE001
+                pass
+        shutil.rmtree(proj, ignore_errors=True)
+    return "written file arrives by itself; send_file works; .env blocked; switch off works; album = 1 task; zip; size limit"
+
+
 TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T3", "isolation", t3_isolation),
          ("T4+T5", "concurrency=5 + queue", t4_t5_concurrency_and_queue),
          ("T6", "same-session serialization", t6_serialization), ("T7", "service restart", t7_restart),
@@ -719,7 +785,8 @@ TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T
          ("T15", "live dashboard + clean General", t15_live_dashboard),
          ("T16", "pinned control panel instead of commands", t16_control_panel),
          ("T17", "General stays clean (sweep, no replies, janitor)", t17_clean_general),
-         ("T18", "voice message → GigaAM → Claude", t18_voice)]
+         ("T18", "voice message → GigaAM → Claude", t18_voice),
+         ("T19", "files: Claude → chat automatically, send_file, albums, limits", t19_files)]
 
 
 async def main(selected: list[str]) -> int:

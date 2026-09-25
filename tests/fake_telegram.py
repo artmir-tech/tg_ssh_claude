@@ -32,9 +32,12 @@ class FakeTelegram(TelegramAPI):
         self.calls.append(method)
         if method == "getMe":
             return {"id": 1, "is_bot": True, "username": "test_bot"}
-        if method in ("sendMessage", "sendDocument"):
+        if method in ("sendMessage", "sendDocument", "sendMediaGroup"):
             msg = {"message_id": next(self._ids), "method": method, "chat_id": p.get("chat_id"),
-                   "thread_id": p.get("message_thread_id"), "text": p.get("text") or p.get("caption") or "",
+                   "files": [v[0] for v in (_files or {}).values()],
+                   "thread_id": p.get("message_thread_id"),
+                   "text": p.get("text") or p.get("caption") or next((x.get("caption") for x in p.get("media") or []
+                                                                     if x.get("caption")), "") or "",
                    "buttons": (p.get("reply_markup") or {}).get("inline_keyboard", []),
                    "reply_to": (p.get("reply_parameters") or {}).get("message_id"), "at": time.time(),
                    "silent": bool(p.get("disable_notification"))}

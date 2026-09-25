@@ -103,6 +103,8 @@ def tool_summary(name: str, inp: dict) -> str:
         return f"🤖 Помощник: {inp.get('description', '')}"
     if name in ("TodoWrite", "TaskCreate", "TaskUpdate"):
         return "📝 Планирует шаги"
+    if name == "mcp__claude_control__send_file":
+        return f"📎 Отправляет файл: {base(inp.get('path'))}"
     if name.startswith("mcp__"):
         return f"🔌 {name.split('__')[-1]}"
     return f"🛠 {name}"
@@ -125,7 +127,7 @@ class ClaudeTurn:
     def __init__(self, *, cli_path: str, cwd: str, claude_session_id: str, resume: bool, prompt: str,
                  model: str | None, permission_mode: str, allowed_tools: list[str],
                  disallowed_tools: list[str], add_dirs: list[str], max_seconds: float,
-                 on_event: EventCallback, can_use_tool: PermissionCallback):
+                 on_event: EventCallback, can_use_tool: PermissionCallback, mcp_servers: dict | None = None):
         self.cwd, self.claude_session_id, self.resume, self.prompt = cwd, claude_session_id, resume, prompt
         self.on_event, self.max_seconds = on_event, max_seconds
         self._stderr: list[str] = []
@@ -141,6 +143,7 @@ class ClaudeTurn:
             add_dirs=add_dirs,
             can_use_tool=can_use_tool,
             env={"CLAUDE_CODE_ENTRYPOINT": ENTRYPOINT},
+            mcp_servers=mcp_servers or {},
             stderr=self._on_stderr,
             **({"resume": claude_session_id} if resume else {"session_id": claude_session_id}),
         )
@@ -247,7 +250,8 @@ class ClaudeTurn:
                 elif isinstance(msg, AssistantMessage):
                     for block in msg.content:
                         if isinstance(block, ToolUseBlock):
-                            await self.on_event("tool", name=block.name, summary=tool_summary(block.name, block.input))
+                            await self.on_event("tool", name=block.name, summary=tool_summary(block.name, block.input),
+                                                input=block.input)
                         elif isinstance(block, TextBlock) and block.text.strip():
                             out.last_text = block.text
                 elif isinstance(msg, RateLimitEvent):

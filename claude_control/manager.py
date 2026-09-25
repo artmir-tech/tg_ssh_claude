@@ -27,6 +27,7 @@ from . import db as D
 from .claude import (ClaudeTurn, TurnOutcome, build_permission_result, grants_from_suggestions, live_sessions,
                      transcript_exists)
 from .config import Config
+from .files import SERVER_NAME, SEND_TOOL, auto_sendable, is_secret, resolve, send_tool_server
 
 log = logging.getLogger("cc.manager")
 
@@ -49,6 +50,8 @@ class ActiveRun:
     last_render: str = ""
     last_edit: float = 0.0
     answers_sent: int = 0
+    written: list[str] = field(default_factory=list)   # files Claude wrote this run (sent after the answer)
+    sent: set[str] = field(default_factory=set)        # files already delivered to the topic this run
 
 
 @dataclass
@@ -214,6 +217,7 @@ class Manager:
                     cli_path=self.cfg.claude_cli, cwd=s.cwd, claude_session_id=s.claude_session_id,
                     resume=resume, prompt=turn.prompt, max_seconds=self.cfg.max_run_hours * 3600,
                     on_event=self._event_handler(ar, turn), can_use_tool=self._permission_handler(ar),
+                    mcp_servers={SERVER_NAME: send_tool_server(self._file_sender(ar))},
                     **self._claude_options(s))
                 log.info("claude run session=%s claude=%s mode=%s", sid, s.claude_session_id[:8],
                          "resume" if resume else "new")
@@ -246,6 +250,7 @@ class Manager:
                 self.set_status(sid, D.QUEUED)
             s = self.db.get_session(sid)
             try:
+                await self._flush_files(ar)   # also after an error/stop: what was written is there
                 await self.ui.run_finished(s, turn, outcome, ar)
             except Exception:  # noqa: BLE001
                 log.exception("run_finished UI failed")
@@ -265,18 +270,47 @@ class Manager:
             elif kind == "tool":
                 ar.steps += 1
                 ar.activity = d["summary"]
+                if d["name"] == "Write" and (d.get("input") or {}).get("file_path"):
+                    path = str(resolve(d["input"]["file_path"], self.db.get_session(ar.session_id).cwd))
+                    if path not in ar.written:
+                        ar.written.append(path)
             elif kind == "background":
                 ar.background = d["count"]
             elif kind == "answer":
                 ar.answers_sent += 1
                 self.db.touch(ar.session_id)
                 await self.ui.deliver_answer(self.db.get_session(ar.session_id), turn, d["text"], ar)
+                await self._flush_files(ar)
             elif kind == "rate_limit":
                 info = d["info"]
                 self.db.kv_set("rate_limit", json.dumps({
                     "status": info.status, "type": info.rate_limit_type, "utilization": info.utilization,
                     "resets_at": info.resets_at, "raw": info.raw, "at": time.time()}))
         return on_event
+
+    # ---- files -----------------------------------------------------------------------------
+    def _file_sender(self, ar: ActiveRun):
+        async def send(path: str, caption: str) -> str:   # the send_file tool (runs inside this process)
+            return await self.ui.send_files(self.db.get_session(ar.session_id), [path], caption=caption,
+                                            ar=ar, requested=True)
+        return send
+
+    async def _flush_files(self, ar: ActiveRun) -> None:
+        """Send files Claude wrote with the Write tool during this run (final versions)."""
+        s = self.db.get_session(ar.session_id)
+        written, ar.written = ar.written, []
+        if not s.send_files:
+            return
+        fresh = []
+        for p in written:
+            path = Path(p)
+            try:
+                if p not in ar.sent and auto_sendable(path) and path.stat().st_mtime >= ar.started_at - 2:
+                    fresh.append(p)
+            except OSError:
+                continue
+        if fresh:
+            await self.ui.send_files(s, fresh, ar=ar)
 
     async def _after_success(self, s: D.Session) -> None:
         """Topic auto-naming and keeping the Claude session title in sync with the topic."""
@@ -301,6 +335,15 @@ class Manager:
                 return PermissionResultDeny(message="Stopped by the user.", interrupt=True)
             if tool_name == "AskUserQuestion":
                 return await self._ask(ar, inp)
+            if tool_name == SEND_TOOL:   # files leaving the server
+                s = self.db.get_session(ar.session_id)
+                path = resolve(str(inp.get("path", "")), s.cwd)
+                if is_secret(path):
+                    return PermissionResultDeny(message="This file holds secrets (keys, tokens, logins) and is "
+                                                        "never sent out of the server.")
+                if path.is_relative_to(Path(s.cwd).resolve()) or path.is_relative_to(self.inbox_dir(s).resolve()):
+                    return PermissionResultAllow()
+                # anywhere else: the owner decides with the usual buttons
             req = PendingRequest(id=secrets.token_hex(4), session_id=ar.session_id, kind="perm",
                                  tool_name=tool_name, input=inp, ctx=ctx,
                                  future=asyncio.get_running_loop().create_future())

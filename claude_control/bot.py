@@ -13,6 +13,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,7 @@ from .render import (TG_LIMIT, ago, clip, clip_words, clock, duration, esc, fold
                      precise_duration, short_path, short_when,
                      split_markdown, tz_name, until, when)
 from .telegram import TelegramAPI, TelegramError
+from .files import SEND_TOOL, human_size, is_secret, resolve, zip_files
 from .voice import Transcriber
 
 log = logging.getLogger("cc.bot")
@@ -110,7 +113,8 @@ ALL_COMMANDS = """<b>Все команды</b>
 TOOL_ACTIONS = {"Bash": "выполнить команду", "Write": "записать файл", "Edit": "изменить файл",
                 "MultiEdit": "изменить файл", "NotebookEdit": "изменить блокнот", "WebFetch": "открыть сайт",
                 "WebSearch": "искать в интернете", "ExitPlanMode": "перейти от плана к работе",
-                "Agent": "запустить помощника", "Task": "запустить помощника", "Skill": "запустить навык"}
+                "Agent": "запустить помощника", "Task": "запустить помощника", "Skill": "запустить навык",
+                SEND_TOOL: "прислать вам файл"}
 
 
 def tool_action(name: str) -> str:
@@ -197,6 +201,7 @@ class Bot:
         self._usage_at = 0.0
         self._flash: tuple[str, float] = ("", 0.0)
         self.voice: Transcriber | None = None
+        self._albums: dict[str, dict] = {}      # media_group_id -> files collected from one Telegram album
         if cfg.voice_engine == "gigaam":
             self.voice = Transcriber(cfg.voice_python)
             if not self.voice.available:
@@ -849,9 +854,6 @@ class Bot:
             if heard is None:
                 return
             text, from_voice = (text + "\n\n" if text else "") + heard, True
-        elif m.get("video") and "document" not in m:
-            await self.notice(topic_id, "🎬 Видео пока не поддерживаются — пришлите его файлом или опишите словами.")
-            return
         if s and text and float(self.db.kv_get(f"rename_wait:{s.id}", "0")) > time.time():
             self.db.conn.execute("DELETE FROM kv WHERE key=?", (f"rename_wait:{s.id}",))
             await self.tg.delete_message(self.chat_id, m["message_id"])
@@ -878,11 +880,36 @@ class Bot:
         files = await self._save_files(m, s)
         if files is None:
             return
+        if m.get("media_group_id"):   # an album arrives as several messages: collect, then act once
+            self._collect_album(m, s, text, files)
+            return
+        await self._submit(s, m["message_id"], text, files, from_voice)
+
+    def _collect_album(self, m: dict, s: D.Session, text: str, files: list[str]) -> None:
+        album = self._albums.setdefault(m["media_group_id"], {"sid": s.id, "text": "", "first": m["message_id"],
+                                                              "files": []})
+        album["files"] += files
+        album["text"] = album["text"] or text
+        if "task" not in album:
+            album["task"] = self._spawn(self._flush_album(m["media_group_id"]))
+
+    async def _flush_album(self, group_id: str) -> None:
+        await asyncio.sleep(2)
+        album = self._albums.pop(group_id)
+        s = self.db.get_session(album["sid"])
+        async with self._locks.setdefault((self.chat_id, s.topic_id), asyncio.Lock()):
+            await self._submit(s, album["first"], album["text"], album["files"])
+
+    async def _submit(self, s: D.Session, message_id: int, text: str, files: list[str],
+                      from_voice: bool = False) -> None:
+        """Queue a user message (with files) for Claude; files without text wait for the next message."""
+        topic_id = s.topic_id
         if files and not text:
             pending = s.pending_file_list + files
             self.db.update_session(s.id, pending_files=json.dumps(pending, ensure_ascii=False))
             names = ", ".join(shown_name(f) for f in files)
-            await self.notice(topic_id, f"📎 Файл сохранён: <b>{esc(names)}</b>\nНапишите, что с ним сделать.")
+            what = "Файл сохранён" if len(files) == 1 else f"Сохранено файлов: {len(files)}"
+            await self.notice(topic_id, f"📎 {what}: <b>{esc(clip(names, 300))}</b>\nНапишите, что с этим сделать.")
             return
         if s.archived:
             await self.unarchive(s, quiet=True)
@@ -893,7 +920,7 @@ class Bot:
         if attached:
             prompt += "\n\n[Файлы от пользователя из Telegram:]\n" + "\n".join(f"- {p}" for p in attached)
             self.db.update_session(s.id, pending_files="[]")
-        turn = self.m.enqueue(s, prompt, self.chat_id, m["message_id"])
+        turn = self.m.enqueue(s, prompt, self.chat_id, message_id)
         if turn is None:
             return
         self.m.schedule()
@@ -902,7 +929,7 @@ class Bot:
     async def _transcribe(self, m: dict, s: D.Session, spoken: dict) -> str | None:
         """Voice / round video / audio -> text via GigaAM. The recording is deleted afterwards."""
         seconds = spoken.get("duration") or 0
-        if seconds > self.cfg.voice_max_min * 60 or (spoken.get("file_size") or 0) > 20 * 1024 * 1024:
+        if seconds > self.cfg.voice_max_min * 60 or (spoken.get("file_size") or 0) > self.cfg.max_receive_mb << 20:
             await self.notice(s.topic_id, f"🎤 Слишком длинная запись — расшифровываю до {self.cfg.voice_max_min} минут "
                                           "(и до 20 МБ). Разбейте на части или пришлите текстом.")
             return None
@@ -1065,6 +1092,8 @@ class Bot:
         model = s.model.capitalize() if s.model else (self.cfg.model or f"как в Claude Code ({default_model_label()})")
         lines += ["", f"Запросов выполнено: {self.db.count_turns(s.id)} · {origin} {when(s.created_at)}",
                   f"Модель: {esc(model)} · папка: {esc(folder_label(s.cwd))}"]
+        lines.append("📎 Файлы, которые делает Claude: " + ("приходят сюда сами" if s.send_files else "не присылаются "
+                                                            "(можно попросить «пришли файл»)"))
         if s.grant_list:
             lines.append("Без вопросов в этой теме: " + esc(", ".join(grant_label(g) for g in s.grant_list)))
         lines += ["", "<blockquote expandable>💻 <b>Открыть на компьютере</b>\n"
@@ -1109,6 +1138,8 @@ class Bot:
                 [btn("🧠 Модель", f"pv:{s.id}:model"), btn("✏️ Переименовать", f"pa:{s.id}:ren")],
                 [btn("🌿 Ветка", f"pv:{s.id}:fork"),
                  btn("📤 Вернуть из архива", f"pa:{s.id}:unarch") if s.archived else btn("🗄 В архив", f"pv:{s.id}:arch")]]
+        rows.append([btn("📎 Файлы от Claude: " + ("присылать ✅" if s.send_files else "не присылать"),
+                         f"pa:{s.id}:files")])
         last = [btn("❔ Все команды", f"pv:{s.id}:help")]
         if not s.started and s.id not in self.m.active:
             last.insert(0, btn("📁 Папка", f"pv:{s.id}:folder"))
@@ -1235,19 +1266,24 @@ class Bot:
         if photos := m.get("photo"):
             p = max(photos, key=lambda x: x.get("file_size") or 0)
             items.append((p["file_id"], f"photo_{m['message_id']}.jpg", p.get("file_size") or 0))
+        if video := m.get("video"):
+            items.append((video["file_id"], video.get("file_name") or f"video_{m['message_id']}.mp4",
+                          video.get("file_size") or 0))
         saved: list[str] = []
         inbox = self.m.inbox_dir(s).resolve()
+        limit = self.cfg.max_receive_mb << 20
         for file_id, name, size in items:
-            if size > 20 * 1024 * 1024:
-                await self.notice(s.topic_id, "⚠️ Файл больше 20 МБ — Telegram не даёт боту скачать такой. "
-                                              "Положите его на сервер другим способом.")
+            if size > limit:
+                await self.notice(s.topic_id, f"⚠️ Файл больше {self.cfg.max_receive_mb} МБ ({human_size(size)}) — "
+                                              "Telegram не даёт боту скачать такой. Положите его на сервер другим "
+                                              "способом или сожмите.")
                 return None
             dest = (inbox / f"{time.strftime('%Y%m%d-%H%M%S')}_{safe_filename(name)}").resolve()
             if dest.parent != inbox:
                 log.warning("rejected suspicious file name in session %s", s.id)
                 return None
             try:
-                await self.tg.download(file_id, dest)
+                await self.tg.download(file_id, dest, limit)
                 os.chmod(dest, 0o600)
             except (TelegramError, ConnectionError, ValueError, OSError) as e:
                 log.warning("file download failed for session %s: %s", s.id, e)
@@ -1256,6 +1292,63 @@ class Bot:
             log.info("file saved for session %s (%d bytes)", s.id, dest.stat().st_size)
             saved.append(str(dest))
         return saved
+
+    # =========================================================================== files to the topic
+    async def send_files(self, s: D.Session, paths: list[str], caption: str = "", ar: ActiveRun | None = None,
+                         requested: bool = False) -> str:
+        """Deliver files to the session's topic. `requested` = Claude called send_file (returns its result
+        text); otherwise these are files Claude wrote. Secrets never leave; too-big files are named instead."""
+        limit = self.cfg.max_send_mb << 20
+        cwd = Path(s.cwd).resolve()
+        ok, big, missing = [], [], []
+        for raw in paths:
+            p = resolve(raw, s.cwd)
+            if is_secret(p):
+                log.warning("refused to send a secret file for session %s", s.id)
+                return "Not sent: this file holds secrets and never leaves the server."
+            if not p.is_file():
+                missing.append(raw)
+            elif p.stat().st_size > limit:
+                big.append(p)
+            elif not ar or str(p) not in ar.sent:
+                ok.append(p)
+        label = lambda p: str(p.relative_to(cwd)) if p.is_relative_to(cwd) else short_path(str(p))  # noqa: E731
+        for p in big:
+            await self._send_topic(s, f"📎 <b>{esc(p.name)}</b> — {human_size(p.stat().st_size)}, больше предела Telegram "
+                                      f"({self.cfg.max_send_mb} МБ). Файл на сервере:\n<code>{esc(str(p))}</code>")
+        if missing and requested:
+            return f"Not sent: file not found: {missing[0]}"
+        if not ok:
+            return "Not sent: the file is larger than Telegram allows; the user was told where it is." if big \
+                else "Already sent to the user in this answer."
+        batch = ok
+        if len(ok) > 10:   # one archive instead of a flood of albums
+            tmp = Path(tempfile.mkdtemp(dir=self.m.inbox_dir(s)))
+            batch = [zip_files(ok, tmp)]
+            if batch[0].stat().st_size > limit:
+                await self._send_topic(s, f"📎 Claude подготовил {len(ok)} файлов — вместе больше {self.cfg.max_send_mb} МБ. "
+                                          f"Они на сервере, например: <code>{esc(str(ok[0].parent))}</code>")
+                shutil.rmtree(tmp, ignore_errors=True)
+                return "Not sent: too large for Telegram together; the user was told where the files are."
+        if caption:
+            text = esc(clip(caption, 900))
+        elif len(batch) == 1 and len(ok) == 1:
+            text = f"📎 {esc(label(ok[0]))} · {human_size(ok[0].stat().st_size)}"
+        else:
+            text = f"📎 Файлы от Claude: {len(ok)}" + (" (в архиве)" if len(ok) > 10 else "")
+        try:
+            await self.tg.send_files(self.chat_id, batch, thread_id=s.topic_id, caption=text)
+        except (TelegramError, ConnectionError, OSError) as e:
+            log.warning("sending files failed for session %s: %s", s.id, e)
+            await self.notice(s.topic_id, "⚠️ Не получилось отправить файл: " + esc(", ".join(p.name for p in ok[:5])))
+            return f"Not sent: Telegram error ({type(e).__name__})."
+        finally:
+            if len(ok) > 10:
+                shutil.rmtree(batch[0].parent, ignore_errors=True)
+        if ar:
+            ar.sent.update(str(p) for p in ok)
+        log.info("sent %d file(s) to session %s (%s)", len(ok), s.id, "requested" if requested else "auto")
+        return "Sent to the user's Telegram chat: " + ", ".join(f"{p.name} ({human_size(p.stat().st_size)})" for p in ok)
 
     # =========================================================================== run UI (called by Manager)
     async def notice(self, topic_id: int, text: str, **kw: Any) -> dict | None:
@@ -1431,6 +1524,10 @@ class Bot:
             if body:
                 out += f"\n<blockquote expandable>{esc(clip_block(body, 700))}</blockquote>"
             return out
+        if name == SEND_TOOL:
+            p = Path(str(inp.get("path", ""))).expanduser()
+            size = f" · {human_size(p.stat().st_size)}" if p.is_file() else ""
+            return f"📄 <b>{esc(p.name)}</b>{size}\n<i>{esc(short_path(str(p.parent)))}</i>"
         if name == "WebFetch":
             return f"🌐 {esc(inp.get('url', ''))}"
         if name == "WebSearch":
@@ -1653,6 +1750,10 @@ class Bot:
         if what == "ren":
             await self.ask_new_title(s, mid)
             return "Напишите новое название сообщением"
+        if what == "files":
+            self.db.update_session(s.id, send_files=0 if s.send_files else 1)
+            await self.show_panel(s, "main", mid)
+            return "Файлы будут приходить сами" if not s.send_files else "Файлы больше не присылаются сами"
         if what == "rencancel":
             self.db.conn.execute("DELETE FROM kv WHERE key=?", (f"rename_wait:{s.id}",))
             await self.show_panel(s, "main", mid)

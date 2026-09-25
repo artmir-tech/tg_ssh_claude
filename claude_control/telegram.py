@@ -66,7 +66,7 @@ class ChatBudget:
 
 class TelegramAPI:
     # Methods that post/edit content in a chat and therefore count against its budget.
-    WRITES = {"sendMessage", "editMessageText", "sendDocument", "editMessageReplyMarkup",
+    WRITES = {"sendMessage", "editMessageText", "sendDocument", "sendMediaGroup", "editMessageReplyMarkup",
               "createForumTopic", "editForumTopic", "closeForumTopic", "reopenForumTopic"}
 
     def __init__(self, token: str, base: str = "https://api.telegram.org"):
@@ -96,6 +96,9 @@ class TelegramAPI:
         for attempt in range(5):
             try:
                 if _files:
+                    for _, fh in _files.values():   # a retry must re-read streamed files from the start
+                        if hasattr(fh, "seek"):
+                            fh.seek(0)
                     data = {k: json.dumps(v) if isinstance(v, (dict, list)) else str(v) for k, v in params.items()}
                     resp = await self._http.post(f"{self._base}/{method}", data=data, files=_files)
                 else:
@@ -194,10 +197,36 @@ class TelegramAPI:
             params["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
         return await self.call("sendDocument", _files={"document": (filename, content)}, **params)
 
+    async def send_files(self, chat_id: int, paths: list[Path], *, thread_id: int | None = None,
+                         caption: str | None = None, reply_to: int | None = None) -> None:
+        """One file -> sendDocument; 2-10 -> one album (sendMediaGroup). Files are streamed from disk,
+        sent as documents so images keep their quality. Caption (HTML) goes under the last file."""
+        handles = [open(p, "rb") for p in paths]
+        try:
+            params: dict[str, Any] = dict(chat_id=chat_id, message_thread_id=thread_id)
+            if reply_to:
+                params["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+            if len(paths) == 1:
+                await self.call("sendDocument", _files={"document": (paths[0].name, handles[0])},
+                                caption=caption, parse_mode="HTML" if caption else None, **params)
+                return
+            media = [{"type": "document", "media": f"attach://f{i}"} for i in range(len(paths))]
+            if caption:
+                media[-1] |= {"caption": caption, "parse_mode": "HTML"}
+            await self.call("sendMediaGroup", media=media,
+                            _files={f"f{i}": (p.name, h) for i, (p, h) in enumerate(zip(paths, handles))}, **params)
+        finally:
+            for h in handles:
+                h.close()
+
     async def download(self, file_id: str, dest: Path, max_bytes: int = 20 * 1024 * 1024) -> int:
         info = await self.call("getFile", file_id=file_id)
         if info.get("file_size", 0) > max_bytes:
             raise ValueError("file too large")
+        if info.get("file_path", "").startswith("/"):   # a local Bot API server (--local) gives a path on disk
+            import shutil
+            shutil.copyfile(info["file_path"], dest)
+            return dest.stat().st_size
         try:
             resp = await self._http.get(f"{self._file_base}/{info['file_path']}")
             resp.raise_for_status()

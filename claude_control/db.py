@@ -107,6 +107,7 @@ class Session:
     last_activity_at: float
     run_started_at: float | None
     control_msg_id: int | None = None   # pinned "control panel" message in the topic
+    send_files: int = 1                 # files Claude writes are sent to the topic automatically
 
     @property
     def grant_list(self) -> list[dict[str, Any]]:
@@ -154,6 +155,8 @@ class Registry:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(sessions)")}
         if "control_msg_id" not in cols:   # added in v0.1.1
             self.conn.execute("ALTER TABLE sessions ADD COLUMN control_msg_id INTEGER")
+        if "send_files" not in cols:       # added in v0.1.2
+            self.conn.execute("ALTER TABLE sessions ADD COLUMN send_files INTEGER NOT NULL DEFAULT 1")
         path.chmod(0o600)
 
     def close(self) -> None:
