@@ -1,0 +1,25 @@
+# systemd *user* unit. %h = the home directory of whoever installs it, so the same file
+# works for any account on the server (the project must live in ~/claude-control).
+[Unit]
+Description=Claude Control - Telegram manager for Claude Code sessions
+StartLimitIntervalSec=600
+StartLimitBurst=20
+
+[Service]
+Type=simple
+WorkingDirectory=%h/claude-control
+EnvironmentFile=%h/claude-control/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=LANG=C.UTF-8
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/claude-control/.venv/bin/python -m claude_control
+Restart=always
+RestartSec=5
+# On stop/restart systemd also ends the Claude processes of running tasks;
+# after start the service marks them as interrupted and offers "Continue".
+KillMode=control-group
+TimeoutStopSec=30
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
