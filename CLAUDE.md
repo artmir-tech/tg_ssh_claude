@@ -9,4 +9,4 @@ Telegram manager for Claude Code sessions (one forum topic = one session). Read 
 - Never use bypassPermissions / --dangerously-skip-permissions; never edit transcripts in ~/.claude/projects.
 - Secrets live in `.env` (chmod 600): never print, log or commit the bot token.
 - The owner is not a programmer: user-facing texts are in Russian and plain language.
-- To set it up for another account on this server: ПЕРЕНОС.md (`deploy/package.sh` → archive in /tmp).
+- Another account on this server: ПЕРЕНОС.md (git clone from GitHub). Publish changes: commit + `git push` (repo is public; never commit .env/data).

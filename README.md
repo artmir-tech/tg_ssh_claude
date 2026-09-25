@@ -1,122 +1,312 @@
 # tg_ssh_claude
 Управление ssh-сервером с Клод Кодом через Телеграм (топики, статусы, лимиты, и пр.)
 
-## Claude Control v0.1
+**Claude Control** — Telegram-пульт для [Claude Code](https://docs.claude.com/en/docs/claude-code/overview) на вашем сервере.
+Одна группа Telegram с темами: **каждая тема — отдельная сессия Claude Code**, а тема **General** — живой дашборд.
+С телефона можно давать задания, отвечать Claude, разрешать ему действия, следить за очередью и лимитами.
+Сессии остаются обычными сессиями Claude Code: их можно продолжить в VS Code или в терминале, и наоборот.
 
-A personal Telegram front end for many Claude Code sessions on this server.
-One forum supergroup ("Claude Control"): the **General** topic is the dashboard, **every other
-topic is exactly one Claude Code session**. The owner's guide in Russian is in [ИНСТРУКЦИЯ.md](ИНСТРУКЦИЯ.md).
+**Содержание:**
+[Возможности](#возможности) ·
+[Как это выглядит](#как-это-выглядит) ·
+[Что нужно](#что-нужно) ·
+[Установка](#установка) ·
+[Настройки](#настройки-env) ·
+[Как пользоваться](#как-пользоваться) ·
+[Обновление](#обновление) ·
+[Несколько аккаунтов](#несколько-аккаунтов-на-одном-сервере) ·
+[Если что-то не работает](#если-что-то-не-работает) ·
+[Безопасность](#безопасность) ·
+[Как устроено](#как-устроено-для-разработчиков) ·
+[Тесты](#тесты) ·
+[Ограничения](#ограничения)
 
-## Architecture
+---
+
+## Возможности
+
+- **Одна тема = одна сессия.** Создали тему и написали задание — появилась новая сессия Claude Code.
+  Следующие сообщения в этой теме продолжают ту же сессию, Claude помнит весь разговор.
+- **Живой дашборд в General:** что сейчас работает (из Telegram и в VS Code), кто ждёт вашего решения, очередь,
+  лимиты Claude (5 часов, неделя, отдельные недельные по моделям) с отсчётом до сброса.
+  Одно сообщение, обновляется само, General не засоряется.
+- **Параллельная работа:** до 5 задач одновременно (настраивается), остальные ждут в очереди и запускаются сами.
+  Внутри одной сессии сообщения выполняются строго по очереди.
+- **Разрешения кнопками:** «✅ Разрешить», «❌ Запретить», «♾ Не спрашивать про … здесь».
+  Вопросы Claude с вариантами ответа — тоже кнопками.
+- **Закреплённая панель в каждой теме:** о сессии, остановить, модель, переименовать, ветка (копия разговора), архив.
+  Команды знать не нужно.
+- **Файлы и фото** из Telegram попадают к Claude.
+- **Совместимость с VS Code:** сессии из Telegram видны в истории разговоров Claude Code в VS Code и в `claude --resume`;
+  сессии из VS Code можно подключить к Telegram. Дашборд показывает и то, что сейчас работает в VS Code.
+- **Надёжность:** работает как служба systemd — без открытого SSH и после перезагрузки сервера.
+  Если бот перезапускался посреди задачи, в теме появится кнопка «▶️ Продолжить».
+- **Безопасность:** управлять может только владелец (по Telegram ID); опасные действия Claude всегда спрашивает;
+  `--dangerously-skip-permissions` не используется.
+
+## Как это выглядит
+
+Дашборд в General (одно сообщение, обновляется само; названия — ссылки на темы):
 
 ```
-Telegram (long polling) ─> bot.py ─> manager.py ─> claude.py ─> /usr/bin/claude (Agent SDK, stream-json)
-                              │           │                          └─ existing claude.ai login (~/.claude)
+📊 Claude Control · 20:38
+
+⚡ Нужны вы
+📱 Feedback competitors · 🔐 разрешение
+
+🟢 Работают
+📱 Research — конкуренты · 12 мин
+💻 Отчёт по продажам · 22 мин
+
+🟡 Очередь
+📱 Черновик статьи · первая
+
+⚪ Свободны
+💻 Идеи для постов
+📱 Конкуренты: обзор рынка
+
+📈 Лимиты
+5 ч ▰▱▱▱▱ 22% · сброс через 40 мин
+Неделя ▰▰▰▰▱ 77% ⚠️ · сброс через 1 дн 21 ч
+
+📱 Telegram · 💻 VS Code
+[🔄 Обновить] [➕ Новая] [📋 Все сессии] [📈 Лимиты]
+```
+
+Закреплённая панель в теме и запрос разрешения:
+
+```
+🎛 Управление сессией              🔐 Claude хочет выполнить команду
+🧠 Opus · 📁 домашняя              python3 analyze.py --input export.csv
+[ℹ️ О сессии]   [⏹ Остановить]     [✅ Разрешить] [❌ Запретить]
+[🧠 Модель]     [✏️ Переименовать]  [♾ Не спрашивать про «python3 analyze.py» здесь]
+[🌿 Ветка]      [🗄 В архив]
+[❔ Все команды]
+```
+
+## Что нужно
+
+- **Linux-сервер с systemd** (проверено на Ubuntu 24.04) и доступ по SSH. Права root не нужны.
+- **Claude Code**, установленный и уже выполнивший вход: `claude auth status` должен показать `"loggedIn": true`.
+  Работает с тем входом, который уже есть у Claude Code (например, подписка Claude Pro/Max) — отдельный API-ключ не нужен.
+- **Python 3.10+** с модулем `venv` и **git** (на Ubuntu обычно уже есть).
+- **Telegram-аккаунт.**
+- **Память:** каждая одновременная задача Claude занимает ~300–400 МБ. Лимит одновременных задач — `MAX_CONCURRENT_RUNS`.
+
+## Установка
+
+### Шаг 1. Telegram (≈5 минут, с телефона)
+
+1. Откройте [@BotFather](https://t.me/BotFather) → `/newbot` → придумайте имя и username, оканчивающийся на `bot`.
+   Скопируйте присланный **token**.
+2. Чаты → ✏️ → **Создать группу** → добавьте своего бота → придумайте название → **Создать**.
+3. Откройте группу → нажмите на название → **Изм.** → включите **Темы** → **Готово**.
+4. Там же: **Изм.** → **Администраторы** → **Добавить администратора** → ваш бот → включите
+   **«Управление темами»**, **«Удаление сообщений»**, **«Закрепление сообщений»** → **Готово**.
+5. В теме **General** напишите `/start`.
+
+> Не включайте себе «Анонимность» в правах администратора — иначе бот не сможет понять, что пишете именно вы.
+
+### Шаг 2. Сервер
+
+```bash
+git clone https://github.com/artmir-tech/tg_ssh_claude.git ~/claude-control
+cd ~/claude-control
+cp .env.example .env && chmod 600 .env
+nano .env                      # впишите TELEGRAM_BOT_TOKEN=<token из шага 1>, сохраните (Ctrl+O, Enter, Ctrl+X)
+python3 deploy/find_ids.py     # покажет TELEGRAM_CHAT_ID и OWNER_IDS — впишите их в .env
+nano .env                      # проверьте DEFAULT_CWD, PROJECT_DIRS, TIMEZONE, MAX_CONCURRENT_RUNS
+bash deploy/install.sh         # зависимости, служба systemd, автозапуск после перезагрузки
+```
+
+Проект должен лежать именно в `~/claude-control` — так настроена служба.
+
+### Шаг 3. Проверка
+
+- `systemctl --user status claude-control` → `active (running)`.
+- В теме General появится дашборд.
+- Создайте тему «Тест» и напишите в неё «Привет! Запомни число 42.», затем «Какое число я просил запомнить?» —
+  Claude ответит «42» в той же теме.
+
+### Или: пусть всё установит Claude Code
+
+Выполните шаг 1 в Telegram, затем откройте Claude Code на сервере и вставьте (заменив токен):
+
+```text
+Разверни готовую систему Claude Control для моего пользователя: склонируй
+https://github.com/artmir-tech/tg_ssh_claude в ~/claude-control и следуй его README.md и CLAUDE.md.
+Не пиши систему заново и не меняй код. Токен моего бота: ВСТАВЬТЕ_ТОКЕН (нигде его не выводи).
+Я уже создал группу с темами, сделал бота администратором и написал /start в General — найди ID группы
+и мой Telegram ID (deploy/find_ids.py), покажи мне имя и username для подтверждения.
+TIMEZONE=Asia/Tbilisi. Никакого --dangerously-skip-permissions.
+После установки проверь службу и логи и скажи, что проверить в Telegram.
+```
+
+## Настройки (`.env`)
+
+Файл `.env` хранится только на сервере (права `600`, в git не попадает). После изменения:
+`systemctl --user restart claude-control`.
+
+| Ключ | По умолчанию | Что это |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | — | токен бота от @BotFather (в логи не пишется) |
+| `OWNER_IDS` | — | Telegram ID тех, кто может управлять (через запятую) |
+| `TELEGRAM_CHAT_ID` | — | ID группы (`-100…`); можно оставить пустым — тогда `/start` владельца в группе привяжет её |
+| `MAX_CONCURRENT_RUNS` | `5` | сколько задач Claude выполняется одновременно |
+| `DEFAULT_CWD` | домашняя папка | папка для новых сессий (лучше — та, что открыта в VS Code: тогда сессии видны там) |
+| `PROJECT_DIRS` | — | папки на выбор в «📁 Папка» (через запятую) |
+| `AUTO_ALLOW_TOOLS` | `WebSearch,WebFetch` | что Claude может делать без вопросов (всё остальное — через кнопки) |
+| `PERMISSION_TIMEOUT_MIN` | `60` | через сколько минут неотвеченный запрос разрешения считается отказом |
+| `MAX_RUN_HOURS` | `8` | предельное время одной задачи |
+| `CLAUDE_MODEL` | как в Claude Code | модель по умолчанию (`opus`, `sonnet`, `haiku`); для темы — кнопка «🧠 Модель» |
+| `TIMEZONE` | время сервера | часовой пояс для времени в Telegram, например `Asia/Tbilisi` |
+
+## Как пользоваться
+
+Подробная инструкция для владельца — **[ИНСТРУКЦИЯ.md](ИНСТРУКЦИЯ.md)**. Коротко:
+
+- **Новая сессия:** создайте тему в группе и напишите задание. Или «➕ Новая» на дашборде.
+- **Продолжить разговор:** пишите в ту же тему. Пока Claude работает, новые сообщения встают в очередь этой темы.
+- **Остановить:** «⏹ Остановить» под сообщением «⚙️ Работаю…» или в панели. История сохраняется.
+- **Панель темы:** нажмите на закреплённую полоску вверху темы. Экраны открываются внутри панели, везде есть «◂ Назад».
+- **Разрешения:** «✅ Разрешить» / «❌ Запретить» / «♾ Не спрашивать про … здесь».
+  Чтобы отказать с пояснением — ответьте (Reply) на запрос текстом.
+- **Файлы и фото:** отправьте в тему; с подписью — Claude сразу возьмётся за задание.
+- **Сессия из VS Code → Telegram:** «📋 Все сессии» → «📥 Подключить из VS Code».
+- **Сессия из Telegram → VS Code:** история разговоров Claude Code в VS Code (под тем же названием)
+  или `cd <папка> && claude --resume <id>` (готовая команда — в «ℹ️ О сессии»).
+
+Команды (всё то же есть на кнопках):
+
+| Где | Команда | Что делает |
+|---|---|---|
+| General | `/status` | опустить дашборд вниз |
+| General | `/new Название` | создать тему-сессию |
+| General | `/import` | подключить сессию из VS Code |
+| General | `/project`, `/diagnostics` | папка для новых сессий; техническая сводка |
+| Тема | `/stop`, `/restart` | остановить; заново выполнить последний запрос |
+| Тема | `/info`, `/model` | о сессии; выбрать модель |
+| Тема | `/rename Название`, `/fork` | переименовать; копия разговора в новой теме |
+| Тема | `/archive`, `/unarchive` | убрать с дашборда / вернуть (история сохраняется) |
+
+## Обновление
+
+```bash
+cd ~/claude-control && git pull && bash deploy/install.sh
+```
+
+Настройки (`.env`) и база (`data/`) не затрагиваются. Задачи, которые выполнялись в момент обновления,
+прервутся — в их темах появится кнопка «▶️ Продолжить».
+
+## Несколько аккаунтов на одном сервере
+
+У каждого пользователя Linux может быть своя система: свой бот, своя группа, свой вход в Claude Code.
+Пошагово — в **[ПЕРЕНОС.md](ПЕРЕНОС.md)**. Нужен отдельный бот на каждого (один токен — одна система),
+а `MAX_CONCURRENT_RUNS` стоит уменьшить: память сервера общая.
+
+## Если что-то не работает
+
+| Что видно | Что сделать |
+|---|---|
+| Бот не отвечает | `systemctl --user status claude-control`; логи: `journalctl --user -u claude-control -n 100` |
+| «У бота нет права «Управление темами»» | права администратора бота в группе (шаг 1.4) |
+| «Claude Code не может авторизоваться» | войти заново: `claude` в терминале сервера → `/login` |
+| «Достигнут лимит Claude» | дождаться сброса — время есть в «📈 Лимиты» |
+| Сессии не видно в VS Code | VS Code показывает сессии только открытой папки; папка сессии — в «ℹ️ О сессии» |
+| Бот перезапускался посреди задачи | в теме нажмите «▶️ Продолжить» |
+| Любая другая странность | `/diagnostics` в General или попросите Claude Code: «проверь claude-control по его README» |
+
+Полезные команды:
+
+```bash
+systemctl --user restart claude-control          # перезапуск
+journalctl --user -u claude-control -f           # логи в реальном времени
+bash ~/claude-control/deploy/install.sh          # переустановить службу и зависимости
+```
+
+## Безопасность
+
+- Управлять ботом может только тот, чей Telegram ID указан в `OWNER_IDS`. Остальных бот игнорирует (даже в той же группе)
+  и сам выходит из чужих групп.
+- Токен бота хранится только в `.env` (права `600`), не пишется в логи и не показывается в `/diagnostics`.
+- Claude работает с обычными разрешениями Claude Code (режим `default`): всё потенциально опасное — через кнопки.
+  Без вопросов — только чтение файлов и то, что указано в `AUTO_ALLOW_TOOLS`.
+  «Не спрашивать про … здесь» действует только в этой теме и не меняет настройки Claude Code.
+- `.env` и база бота закрыты для инструментов Claude (Read/Edit/Write).
+- Бот работает от вашего пользователя Linux (так он использует ваш вход в Claude Code), без root.
+
+## Как устроено (для разработчиков)
+
+```
+Telegram (long polling) ─> bot.py ─> manager.py ─> claude.py ─> claude CLI (Agent SDK, stream-json)
+                              │           │                          └─ существующий вход Claude Code (~/.claude)
                               └──── db.py (SQLite: data/claude-control.db)
 ```
 
-| File | Responsibility |
+| Файл | За что отвечает |
 |---|---|
-| `claude_control/config.py` | Settings from `.env` / environment |
-| `claude_control/db.py` | Registry: `sessions` (topic ↔ Claude session), `turns` (per-session queue), `kv`, update dedupe |
-| `claude_control/telegram.py` | Thin Bot API client: token redaction, per-chat send budget (≈20 msg/min), 429 handling |
-| `claude_control/claude.py` | Runs **one user turn** through `ClaudeSDKClient` (resume/new, background tasks, stop, permissions) |
-| `claude_control/manager.py` | Worker pool (`MAX_CONCURRENT_RUNS`), per-session serialization, status machine, recovery |
-| `claude_control/bot.py` | Commands, dashboard, progress messages, permission/question buttons, files, import/fork |
-| `claude_control/render.py` | Markdown → Telegram HTML, splitting, human time formats |
-| `tests/acceptance.py` | End-to-end tests with real Claude (haiku) and a fake Telegram (`tests/fake_telegram.py`) |
+| `claude_control/config.py` | настройки из `.env` / окружения |
+| `claude_control/db.py` | реестр: `sessions` (тема ↔ сессия Claude), `turns` (очередь сообщений), `kv`, защита от повторных апдейтов |
+| `claude_control/telegram.py` | тонкий клиент Bot API: скрытие токена, лимит ~20 сообщений/мин на группу, обработка 429 |
+| `claude_control/claude.py` | один ход сессии через `ClaudeSDKClient` (новая/продолжение, фоновые задачи, остановка, разрешения) |
+| `claude_control/manager.py` | пул исполнителей (`MAX_CONCURRENT_RUNS`), очередь внутри сессии, статусы, восстановление, синхронизация названий |
+| `claude_control/bot.py` | дашборд, панель темы, кнопки, разрешения и вопросы, файлы, импорт/ветки, уборка General, лимиты |
+| `claude_control/render.py` | Markdown → HTML Telegram (таблицы → списки), разбиение длинных ответов, время |
+| `deploy/` | служба systemd (`%h` — одинакова для любого пользователя), `install.sh`, `find_ids.py`, `package.sh` |
+| `tests/` | приёмочные тесты: настоящий Claude (haiku) + поддельный Telegram |
 
-### Key decisions
-- **One process per turn.** Each Telegram message = `claude` started with `resume=<id>` (or `session_id=<id>` for the
-  first turn — the UUID is generated and stored in SQLite *before* the run). No idle processes; 25 sessions ≠ 25 processes.
-- **Real Claude Code sessions.** Transcripts live in `~/.claude/projects/…` as usual. The service never edits them;
-  it only uses the SDK's official `rename_session` / `fork_session` / `list_sessions` / `get_session_info`.
-- **Visible in `claude --resume` / VS Code.** The CLI hides sessions whose entrypoint is `sdk-*`, so turns are
-  started with `CLAUDE_CODE_ENTRYPOINT=claude-control` and the user message carries `origin: {"kind": "human"}`.
-- **Background tasks.** If Claude backgrounds work, the run stays connected until the tasks finish and Claude's
-  follow-up turn arrives (each `ResultMessage` is delivered to Telegram).
-- **Permissions.** Mode `default` + `can_use_tool` → Telegram buttons (Allow once / Allow in this session / Deny,
-  or a Telegram *reply* to the request = deny with feedback; other messages are queued; plain text answers an AskUserQuestion). "In this session" grants are stored in `sessions.grants` and passed as
-  `allowed_tools` to later turns — never written to settings files. `AUTO_ALLOW_TOOLS` (default WebSearch, WebFetch)
-  run without asking. `bypassPermissions` / `--dangerously-skip-permissions` are never used. `.env` and the DB are
-  denied to Claude's Read/Edit/Write tools. Unanswered requests are denied after `PERMISSION_TIMEOUT_MIN`.
-  `AskUserQuestion` becomes option buttons (status `WAITING`).
-- **VS Code awareness.** `~/.claude/sessions/<pid>.json` (written by Claude Code itself, read-only here) gives the
-  open interactive sessions and their `busy`/`idle` state. The dashboard counts them; a queued Telegram turn for a
-  session that is `busy` in VS Code waits until it is idle (re-checked every 5 s).
-- **Live dashboard.** One message in General (`kv.dashboard_msg_id`) is edited every 60 s and ~8 s after any
-  status change (`Bot.dashboard_changed`). `/status` reposts it at the bottom. Commands in General are deleted;
-  bot service replies there are ephemeral (`kv.ephemeral`, deleted after 90 s / 10 min).
-- **UI conventions.** The topic panel (`panel_view`, pinned) and the General dashboard (`render_view`) are small
-  in-place apps: buttons edit the same message, every sub-screen has «◂ Назад», archive/fork ask first.
-  General holds only the dashboard: user messages there are deleted after handling, feedback is a 🔔 `flash`
-  line; `_janitor` removes tracked General messages after 5 idle minutes; `sweep_general` (one-time at
-  upgrade, or the «🧹» button) removes leftovers of old versions by forwarding unknown ids into a temporary
-  topic and matching exact General-only texts. Topic service notices (`notice`) self-delete after 60 s.
-- **Limits.** Two read-only sources, fresher wins per window: each run's `RateLimitEvent.raw.unifiedWindows`
-  (`kv.rate_limit`) and Claude Code's own cache `cachedUsageUtilization` in `~/.claude.json` (incl. per-model week).
-  Every 5 min (and on 🔄) the bot runs `claude -p /usage --no-session-persistence` — a local command, no model call,
-  no tokens — which refreshes that cache. Times use `TIMEZONE` (IANA name) or server time.
-- **Security.** Only `OWNER_IDS` can do anything; the bot ignores everyone else and leaves foreign chats.
+Ключевые решения:
 
-### Session statuses
-`NEW` (no turn yet) → `QUEUED` (waiting for a worker) → `RUNNING` ⇄ `WAITING_APPROVAL` / `WAITING` (question) →
-`IDLE` (done) | `ERROR` (failed; Retry/Details buttons) | `STOPPED` (/stop or interrupted by a restart).
-`ARCHIVED` hides it from the dashboard (transcript kept). Turn statuses: `queued running done error stopped
-interrupted cancelled`.
+- **Один процесс на ход.** Каждое сообщение — запуск `claude` с `resume=<id>` (или `session_id=<id>` для первого хода;
+  UUID создаётся и сохраняется в SQLite *до* запуска). Простаивающих процессов нет: 25 сессий ≠ 25 процессов.
+- **Настоящие сессии Claude Code.** История лежит в `~/.claude/projects/…` как обычно. Бот её не редактирует,
+  а пользуется официальными функциями SDK: `rename_session`, `fork_session`, `list_sessions`, `get_session_info`
+  (переименование — атомарная дозапись строки, безопасна и во время работы сессии).
+- **Видимость в `claude --resume` и VS Code.** CLI скрывает сессии с меткой `sdk-*`, поэтому ходы запускаются с
+  `CLAUDE_CODE_ENTRYPOINT=claude-control`, а сообщение пользователя помечается `origin: {"kind": "human"}`.
+- **Фоновые задачи.** Если Claude уводит работу в фон, ход остаётся подключённым до её окончания и ответа Claude.
+- **Разрешения.** Режим `default` + `can_use_tool` → кнопки. «Не спрашивать здесь» хранится в `sessions.grants`
+  и передаётся следующим ходам как `allowed_tools` (в файлы настроек не пишется). `AskUserQuestion` → кнопки вариантов.
+- **VS Code.** `~/.claude/sessions/<pid>.json` (их пишет сам Claude Code, бот только читает) — какие сессии открыты
+  и заняты. Сообщение из Telegram в сессию, занятую в VS Code, ждёт её освобождения.
+- **Лимиты.** Два источника, по каждому окну берётся более свежий: `RateLimitEvent` из запусков бота и кеш Claude Code
+  `cachedUsageUtilization` в `~/.claude.json`. Раз в 5 минут бот вызывает `claude -p /usage --no-session-persistence`
+  (локальная команда: без обращения к модели и без трат лимита), чтобы кеш был свежим.
+- **Интерфейс.** Панель темы (`panel_view`) и дашборд (`render_view`) — «мини-приложения в одном сообщении»:
+  кнопки правят то же сообщение, у подэкранов есть «◂ Назад», архив и ветка спрашивают подтверждение.
+  В General — только дашборд: сообщения пользователя удаляются после выполнения, ответы — строкой 🔔 (`flash`),
+  `_janitor` чистит General через 5 минут тишины, `sweep_general` убирает остатки старых версий.
+  Служебные сообщения в темах (`notice`) удаляются через минуту.
 
-### Recovery
-On start, turns left `running` are marked `interrupted`, any surviving Claude process of that session is killed,
-the session becomes `STOPPED`, and the topic gets "⚠️ … [▶️ Continue] [🔁 Retry]". Queued turns simply run.
-Telegram updates are de-duplicated (`processed_updates`, UNIQUE(chat_id, message_id) on turns).
+Статусы сессии: `NEW` → `QUEUED` → `RUNNING` ⇄ `WAITING_APPROVAL` / `WAITING` (вопрос) →
+`IDLE` | `ERROR` (кнопки «Повторить», «Подробнее») | `STOPPED` (остановлена или прервана перезапуском); `ARCHIVED`.
 
-## Operations
+Восстановление после перезапуска: незавершённые ходы помечаются `interrupted`, уцелевший процесс Claude этой сессии
+останавливается, в теме появляется «▶️ Продолжить / 🔁 Повторить». Очередь продолжает выполняться.
+Повторная доставка апдейтов Telegram не приводит к повторной отправке сообщения в Claude.
+
+## Тесты
 
 ```bash
-systemctl --user status claude-control          # state
-systemctl --user restart claude-control         # restart (running tasks get a Continue button)
-journalctl --user -u claude-control -f          # live logs
-journalctl --user -u claude-control -n 300 --no-pager
-sqlite3 data/claude-control.db 'select id,title,status,claude_session_id from sessions'   # (python3 -c if no sqlite3)
-bash deploy/install.sh                          # (re)install venv + unit, enable linger, restart
+cd ~/claude-control
+env -i HOME=$HOME PATH=/usr/bin:/bin LANG=C.UTF-8 .venv/bin/python -m tests.acceptance         # все (~5 минут)
+env -i HOME=$HOME PATH=/usr/bin:/bin LANG=C.UTF-8 .venv/bin/python -m tests.acceptance T1 T9   # выборочно
 ```
 
-The service is a **systemd user unit** (`~/.config/systemd/user/claude-control.service`) with linger enabled,
-so it runs without an SSH login and starts at boot. It runs as the account's own Linux user because it must use that user's Claude login.
+17 сценариев: новая сессия, продолжение, изоляция, 5 параллельных задач и очередь, очередь внутри сессии,
+перезапуск службы, чужой пользователь, остановка, совместимость с `claude --resume`, ошибка и «Повторить»,
+кнопки разрешений и вопросов, импорт/ветка/переименование/архив/файлы, VS Code и лимиты, дашборд,
+панель темы, чистота General. Используется настоящий Claude (модель haiku — дёшево) и поддельный Telegram.
+`env -i` нужен, если тесты запускаются из самой сессии Claude Code. Тестовые сессии удаляются после прогона
+(`KEEP_SESSIONS=1` — оставить). Результат — в `tests/report.json`.
 
-### Configuration (`.env`, chmod 600, not in git)
-| Key | Default | Meaning |
-|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | — | bot token (never logged) |
-| `OWNER_IDS` | — | comma-separated Telegram user ids allowed to control |
-| `TELEGRAM_CHAT_ID` | — | the forum supergroup id (or bound by `/start` from an owner) |
-| `MAX_CONCURRENT_RUNS` | 5 | parallel Claude processes |
-| `DEFAULT_CWD` | `$HOME` | folder for new sessions (`/project` changes it at runtime) |
-| `PROJECT_DIRS` | — | folders offered by `/project` |
-| `AUTO_ALLOW_TOOLS` | `WebSearch,WebFetch` | tools that never ask |
-| `PERMISSION_TIMEOUT_MIN` | 60 | unanswered permission → deny |
-| `MAX_RUN_HOURS` | 8 | hard stop for one run |
-| `CLAUDE_MODEL` | (Claude Code default) | e.g. `sonnet`; per session via `/model` |
-| `TIMEZONE` | server time (UTC) | IANA zone for times shown in Telegram, e.g. `Asia/Tbilisi` |
+## Ограничения
 
-## Another account on this server
-See [ПЕРЕНОС.md](ПЕРЕНОС.md). `bash deploy/package.sh` builds `/tmp/claude-control.tar.gz` (code + docs, no `.env`/`data`);
-the other user extracts it to `~/claude-control`, fills `.env` (own bot token, own owner id/group) and runs
-`deploy/install.sh`. The unit uses `%h`, so it is identical for every account. Use a lower `MAX_CONCURRENT_RUNS`
-when several systems share the server (each Claude process ≈ 300–400 MB RAM).
+- Голосовые и видео не поддерживаются; файлы — до 20 МБ (ограничение Bot API).
+- Telegram разрешает боту ~20 сообщений в минуту на группу: при большой нагрузке обновления статусов реже.
+- Не пишите в одну сессию одновременно из VS Code и из Telegram (бот предупреждает и ждёт, если она занята в VS Code).
+- Создавать и переименовывать темы бот может только с правом администратора «Управление темами».
 
-## Tests
-```bash
-env -i HOME=$HOME PATH=/usr/bin:/bin LANG=C.UTF-8 .venv/bin/python -m tests.acceptance        # all (~10 min)
-env -i HOME=$HOME PATH=/usr/bin:/bin LANG=C.UTF-8 .venv/bin/python -m tests.acceptance T1 T9  # some
-```
-`env -i` matters when run from inside a Claude Code session (its env vars would leak into the child CLI).
-Results go to `tests/report.json`; test sessions are deleted afterwards (`KEEP_SESSIONS=1` keeps them).
+## Лицензия
 
-## Known limits (v0.1)
-- Voice/video messages are not supported; files ≤ 20 MB (Bot API limit). Albums: each photo is saved; the
-  caption triggers the turn.
-- Telegram allows ~20 bot messages/min per group: progress edits are skipped when the budget is tight.
-- If the same session is open in VS Code and used from Telegram at the same moment, both write to one transcript —
-  the bot warns about it; avoid simultaneous use.
-- Creating/renaming topics needs the bot's admin right "Manage topics".
+MIT — см. [LICENSE](LICENSE).
