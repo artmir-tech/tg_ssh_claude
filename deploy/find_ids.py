@@ -15,10 +15,15 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def token() -> str:
-    for line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
+    env = ROOT / ".env"
+    if not env.exists():
+        sys.exit("Нет файла .env. Сначала: cp .env.example .env — и впишите в него TELEGRAM_BOT_TOKEN.")
+    for line in env.read_text(encoding="utf-8").splitlines():
         if line.startswith("TELEGRAM_BOT_TOKEN="):
-            return line.split("=", 1)[1].strip().strip('"').strip("'")
-    sys.exit("TELEGRAM_BOT_TOKEN не найден в .env")
+            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            if value:
+                return value
+    sys.exit("В .env не заполнен TELEGRAM_BOT_TOKEN — впишите токен от @BotFather.")
 
 
 def summarize(updates: list[dict]) -> tuple[dict, dict]:
@@ -37,8 +42,9 @@ def summarize(updates: list[dict]) -> tuple[dict, dict]:
 
 
 def main() -> None:
+    url = f"https://api.telegram.org/bot{token()}/getUpdates?timeout=0"
     try:
-        with urllib.request.urlopen(f"https://api.telegram.org/bot{token()}/getUpdates?timeout=0", timeout=20) as r:
+        with urllib.request.urlopen(url, timeout=20) as r:
             data = json.load(r)
     except Exception as e:  # noqa: BLE001
         sys.exit(f"Не удалось связаться с Telegram ({type(e).__name__}). Если сервис уже запущен — остановите его: "
