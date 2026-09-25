@@ -74,6 +74,11 @@ class Config:
         return self.data_dir / "claude-control.db"
 
     @property
+    def restart_flag(self) -> Path:
+        """Written by deploy/restart-when-idle.sh: finish running tasks, start no new ones, restart."""
+        return self.data_dir / "restart-pending"
+
+    @property
     def inbox_root(self) -> Path:
         return self.data_dir / "inbox"
 

@@ -863,6 +863,22 @@ async def t20_permission_modes(h: Harness, ctx: dict) -> str:
         msg = await h.tg.send_message(CHAT, "<b>x</b>" + "слово " * 1200, thread_id=topic)
         check(msg and len(h.tg.sent[-1]["text"]) <= 4096 and "сокращено" in h.tg.sent[-1]["text"], "too long -> shortened")
         h.tg.too_long.clear()
+
+        # an update restart is pending: running tasks finish, queued ones wait for the new version
+        h.cfg.restart_flag.touch()
+        topic2 = await h.new_topic("Test M — update")
+        await h.say(topic2, "Reply exactly: AFTER-RESTART")
+        await asyncio.sleep(2)
+        check(h.turns(topic2)[-1].status == "queued" and h.session(topic2).id not in h.m.active,
+              "while a restart is pending new tasks wait in the queue")
+        await h.m.recover()   # what the new version does on start: removes the flag, starts the queue
+        check(not h.cfg.restart_flag.exists(), "the new version removes the flag")
+        turn = await h.wait_idle(topic2, 120)
+        check(turn.status == "done" and "AFTER-RESTART" in h.answers(topic2)[-1], "the queued task ran after the restart")
+        h.cfg.restart_flag.touch()
+        old = time.time() - 3 * 3600
+        os.utime(h.cfg.restart_flag, (old, old))
+        check(not h.m.restart_pending() and not h.cfg.restart_flag.exists(), "a forgotten flag expires by itself")
     finally:
         h.cfg.permission_mode = "default"
         h.auto_approve = True
@@ -870,7 +886,8 @@ async def t20_permission_modes(h: Harness, ctx: dict) -> str:
             shutil.rmtree(f, ignore_errors=True) if f.is_dir() else f.unlink(missing_ok=True)
     return ("legacy sessions follow .env; picker with Haiku warning; Sonnet in Auto ran a command without asking, "
             "but still asked before sending a file from outside the folder; "
-            "«Разрешить и включить Авто» switched the running task — second command not asked")
+            "«Разрешить и включить Авто» switched the running task — second command not asked; "
+            "update restart holds the queue and the new version runs it")
 
 
 TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T3", "isolation", t3_isolation),

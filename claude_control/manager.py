@@ -31,6 +31,7 @@ from .config import PERMISSION_MODES, Config, safe_mode
 from .files import SERVER_NAME, SEND_TOOL, auto_sendable, is_secret, resolve, send_tool_server
 
 log = logging.getLogger("cc.manager")
+RESTART_FLAG_TTL_S = 2 * 3600   # deploy/restart-when-idle.sh gives up after 1 hour
 
 CONTINUE_PROMPT = "Продолжи с того места, где остановился."
 
@@ -162,7 +163,26 @@ class Manager:
                     ids.add(s.id)
         return ids
 
+    def restart_pending(self) -> bool:
+        """An update is waiting for the running tasks to finish: queued ones start after the restart
+        (on the new version) instead of keeping the old one alive. A leftover flag expires."""
+        flag = self.cfg.restart_flag
+        try:
+            if time.time() - flag.stat().st_mtime < RESTART_FLAG_TTL_S:
+                return True
+            flag.unlink()
+            log.warning("stale restart flag removed")
+        except FileNotFoundError:
+            pass
+        return False
+
     def schedule(self) -> None:
+        if self.restart_pending():
+            if self.db.turns_with_status("queued"):
+                log.info("restart pending: queued tasks wait for the new version")
+            for sid in self.db.queued_sessions_in_order():
+                self._settle_status(sid)
+            return
         blocked = self.busy_elsewhere() if self.db.turns_with_status("queued") else set()
         while len(self.active) < self.cfg.max_concurrent:
             turn = self.db.next_runnable_turn(set(self.active) | blocked)
@@ -499,6 +519,7 @@ class Manager:
 
     async def recover(self) -> None:
         """After a restart: runs that were in flight are gone - mark them and tell the user."""
+        self.cfg.restart_flag.unlink(missing_ok=True)   # this is the new version: queued tasks may start
         for turn in self.db.turns_with_status("running"):
             s = self.db.get_session(turn.session_id)
             self._kill_orphan(s)
