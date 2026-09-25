@@ -293,7 +293,7 @@ Telegram (long polling) ─> bot.py ─> manager.py ─> claude.py ─> claude C
 | `claude_control/render.py` | Markdown → HTML Telegram (таблицы → списки), разбиение длинных ответов, время |
 | `claude_control/files.py` | какие файлы можно выносить с сервера, автоотправка, инструмент `send_file` для Claude |
 | `claude_control/voice.py` | расшифровка голосовых: GigaAM v3 в отдельном процессе из `.venv-voice`, нарезка по паузам до 22 с |
-| `deploy/` | служба systemd (`%h` — одинакова для любого пользователя), `install.sh`, `find_ids.py`, `package.sh` |
+| `deploy/` | служба systemd (`%h` — одинакова для любого пользователя), `install.sh`, `find_ids.py`, `restart-when-idle.sh` (обновление без прерывания задач) |
 | `tests/` | приёмочные тесты: настоящий Claude (haiku) + поддельный Telegram |
 
 Ключевые решения:

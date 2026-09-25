@@ -7,5 +7,4 @@ __pycache__/
 tests/work/
 tests/report.json
 tests/last-run.log
-dist/
 docs/
