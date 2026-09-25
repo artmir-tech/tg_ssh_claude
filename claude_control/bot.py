@@ -28,6 +28,7 @@ from .render import (TG_LIMIT, ago, clip, clip_words, clock, duration, esc, fold
                      precise_duration, short_path, short_when,
                      split_markdown, tz_name, until, when)
 from .telegram import TelegramAPI, TelegramError
+from .voice import Transcriber
 
 log = logging.getLogger("cc.bot")
 
@@ -81,7 +82,7 @@ TOPIC_HELP = """<b>Эта тема — сессия Claude</b>
 Пишите сообщения — Claude ответит и будет помнить весь разговор.
 
 🎛 Кнопки управления — в закреплённом сообщении: нажмите на полоску вверху темы.
-📎 Файлы и фото можно присылать прямо сюда."""
+📎 Файлы и фото можно присылать прямо сюда. 🎙 Можно надиктовать голосом."""
 
 MODEL_TEXT = ("🧠 <b>Модель для этой темы</b>\n\n<b>Opus</b> — самая сильная, быстрее тратит лимит\n"
               "<b>Sonnet</b> — быстрее, хватает для большинства задач\n<b>Haiku</b> — самая быстрая, для простого")
@@ -195,6 +196,12 @@ class Bot:
         self._live_sig: tuple = ()
         self._usage_at = 0.0
         self._flash: tuple[str, float] = ("", 0.0)
+        self.voice: Transcriber | None = None
+        if cfg.voice_engine == "gigaam":
+            self.voice = Transcriber(cfg.voice_python)
+            if not self.voice.available:
+                log.error("VOICE_ENGINE=gigaam but %s is missing: run deploy/install.sh", cfg.voice_python)
+                self.voice = None
 
     # =========================================================================== lifecycle
     async def run(self) -> None:
@@ -222,6 +229,8 @@ class Bot:
 
     async def stop(self) -> None:
         self.stopping.set()
+        if self.voice:
+            await self.voice.stop()
 
     async def _poll_loop(self) -> None:
         offset = int(self.db.kv_get("tg_offset", "0"))
@@ -342,7 +351,8 @@ class Bot:
             if not user.get("is_bot") and (text or m.get("document") or m.get("photo")):
                 log.warning("ignored message from unauthorized user id=%s", user.get("id"))
             return
-        if cmd is None and not text and not any(k in m for k in ("document", "photo", "voice", "audio", "video")):
+        if cmd is None and not text and not any(k in m for k in ("document", "photo", "voice", "audio", "video",
+                                                                  "video_note")):
             return  # service messages, stickers etc.
         if topic_id is None:
             await self._general(m, cmd, args)
@@ -826,9 +836,21 @@ class Bot:
         if cmd is not None:
             await self._topic_command(m, topic_id, s, cmd, args)
             return
-        if any(k in m for k in ("voice", "audio", "video")) and "document" not in m:
-            await self.notice(topic_id, "🎤 Голосовые и видео пока не поддерживаются — напишите текстом "
-                                        "или пришлите файлом.")
+        spoken = m.get("voice") or m.get("audio") or m.get("video_note")
+        from_voice = False
+        if spoken and "document" not in m:
+            if not self.voice:
+                await self.notice(topic_id, "🎤 Расшифровка голосовых на сервере не включена — напишите текстом.")
+                return
+            if s is None:
+                s = self._session_for_new_topic(m, topic_id)
+                await self.ensure_control_card(s)
+            heard = await self._transcribe(m, s, spoken)
+            if heard is None:
+                return
+            text, from_voice = (text + "\n\n" if text else "") + heard, True
+        elif m.get("video") and "document" not in m:
+            await self.notice(topic_id, "🎬 Видео пока не поддерживаются — пришлите его файлом или опишите словами.")
             return
         if s and text and float(self.db.kv_get(f"rename_wait:{s.id}", "0")) > time.time():
             self.db.conn.execute("DELETE FROM kv WHERE key=?", (f"rename_wait:{s.id}",))
@@ -866,7 +888,8 @@ class Bot:
             await self.unarchive(s, quiet=True)
             s = self.db.get_session(s.id)
         attached = s.pending_file_list + files
-        prompt = text
+        prompt = text + ("\n\n[Это расшифровка голосового сообщения — возможны ошибки распознавания.]"
+                         if from_voice else "")
         if attached:
             prompt += "\n\n[Файлы от пользователя из Telegram:]\n" + "\n".join(f"- {p}" for p in attached)
             self.db.update_session(s.id, pending_files="[]")
@@ -875,6 +898,41 @@ class Bot:
             return
         self.m.schedule()
         await self._queue_notice(s, turn)
+
+    async def _transcribe(self, m: dict, s: D.Session, spoken: dict) -> str | None:
+        """Voice / round video / audio -> text via GigaAM. The recording is deleted afterwards."""
+        seconds = spoken.get("duration") or 0
+        if seconds > self.cfg.voice_max_min * 60 or (spoken.get("file_size") or 0) > 20 * 1024 * 1024:
+            await self.notice(s.topic_id, f"🎤 Слишком длинная запись — расшифровываю до {self.cfg.voice_max_min} минут "
+                                          "(и до 20 МБ). Разбейте на части или пришлите текстом.")
+            return None
+        status = await self._send_topic(s, "🎙 Расшифровываю…", reply_to=m["message_id"], silent=True)
+        sid = status["message_id"] if status else None
+        ext = re.sub(r"[^A-Za-z0-9]", "", Path(spoken.get("file_name") or "").suffix)[:5] \
+            or ("mp4" if "video_note" in m else "ogg")
+        dest = self.m.inbox_dir(s) / f"voice-{m['message_id']}.{ext}"
+        started = time.time()
+        try:
+            await self.tg.download(spoken["file_id"], dest)
+            text = await self.voice.transcribe(dest, seconds)
+        except Exception as e:  # noqa: BLE001 - any failure -> a clear message, never a traceback
+            log.warning("voice transcription failed for session %s: %s", s.id, e)
+            if sid:
+                await self._safe_edit(sid, "⚠️ Не получилось расшифровать голосовое. Попробуйте ещё раз или напишите текстом.")
+                self.ephemeral(sid, SHORT_TTL)
+            return None
+        finally:
+            dest.unlink(missing_ok=True)
+        log.info("voice transcribed for session %s: %ss audio in %.1fs, %d chars", s.id, seconds,
+                 time.time() - started, len(text))
+        if not text:
+            if sid:
+                await self._safe_edit(sid, "🎙 Не разобрал слов — повторите, пожалуйста.")
+                self.ephemeral(sid, SHORT_TTL)
+            return None
+        if sid:
+            await self._safe_edit(sid, f"🎙 <i>{esc(clip_block(text, 3500))}</i>")
+        return text
 
     def _session_for_new_topic(self, m: dict, topic_id: int) -> D.Session:
         name = self.db.topic_name(self.chat_id, topic_id)
@@ -1278,6 +1336,8 @@ class Bot:
             try:
                 await self._cleanup_ephemeral()
                 await self._janitor()
+                if self.voice:
+                    await self.voice.reap_idle()
             except Exception:  # noqa: BLE001
                 log.exception("cleanup failed")
             for ar in list(self.m.active.values()):
@@ -1728,7 +1788,9 @@ class Bot:
                  f"Сессий: {len(all_s)} (в архиве: {sum(s.archived for s in all_s)})",
                  f"База: <code>{esc(str(self.cfg.db_path))}</code> ({self.cfg.db_path.stat().st_size // 1024} КБ)",
                  f"Папка по умолчанию: <code>{esc(self.m.default_cwd())}</code> · часовой пояс: {tz_name()}",
-                 f"Без подтверждения: {esc(', '.join(self.cfg.auto_allow_tools) or 'ничего')} + чтение файлов"]
+                 f"Без подтверждения: {esc(', '.join(self.cfg.auto_allow_tools) or 'ничего')} + чтение файлов",
+                 "Голос: " + ("выключен" if not self.voice else "GigaAM v3 — " + (
+                     "модель загружена" if self.voice.proc and self.voice.proc.returncode is None else "загрузится по первому голосовому"))]
         if self.m.active:
             lines.append("\n<b>Активные процессы</b>")
             for ar in self.m.active.values():

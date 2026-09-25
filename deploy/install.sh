@@ -20,6 +20,15 @@ mkdir -p data && chmod 700 data
 .venv/bin/pip install -q --upgrade pip
 .venv/bin/pip install -q -r requirements.txt
 
+# Voice messages (optional): GigaAM in its own venv, so the bot's venv stays small.
+if grep -q '^VOICE_ENGINE=gigaam' .env; then
+  command -v ffmpeg >/dev/null || { echo "Voice needs ffmpeg (sudo apt install ffmpeg) - or remove VOICE_ENGINE from .env"; exit 1; }
+  [ -d .venv-voice ] || python3 -m venv .venv-voice
+  .venv-voice/bin/pip install -q --upgrade pip
+  .venv-voice/bin/pip install -q -r requirements-voice.txt
+  echo "Voice recognition installed (the model, ~430 MB, downloads on the first voice message)"
+fi
+
 mkdir -p ~/.config/systemd/user
 cp deploy/claude-control.service ~/.config/systemd/user/claude-control.service
 

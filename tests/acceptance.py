@@ -47,7 +47,8 @@ class Harness:
         self.data_dir = data_dir
         self.cfg = Config(bot_token="123:FAKE-TOKEN", owner_ids={OWNER}, chat_id=CHAT, max_concurrent=max_concurrent,
                           default_cwd=str(WORK), project_dirs=[str(WORK)], model="haiku", data_dir=data_dir,
-                          permission_timeout_s=300)
+                          permission_timeout_s=300,
+                          voice_engine="gigaam" if (ROOT.parent / ".venv-voice/bin/python").exists() else "")
         self.db = D.Registry(self.cfg.db_path)
         self.tg = FakeTelegram()
         self.m = Manager(self.cfg, self.db)
@@ -130,7 +131,7 @@ class Harness:
 
     def answers(self, topic: int) -> list[str]:
         """Bot messages in the topic that are Claude answers (not status/queue/permission notices)."""
-        skip = ("⚙️", "🟡 В очереди", "📥", "🔐", "⏹", "🆕", "⚠️", "🔴", "❓", "✅ Разрешено", "💬", "👋", "📎", "💻", "🎛", "✏️")
+        skip = ("⚙️", "🟡 В очереди", "📥", "🔐", "⏹", "🆕", "⚠️", "🔴", "❓", "✅ Разрешено", "💬", "👋", "📎", "💻", "🎛", "✏️", "🎙")
         return [m["text"] for m in self.tg.in_topic(topic) if not m["text"].startswith(skip)]
 
     async def wait(self, cond, timeout: float, what: str) -> None:
@@ -672,6 +673,41 @@ async def t17_clean_general(h: Harness, ctx: dict) -> str:
     return f"sweep removed {removed} old General messages (topics untouched); General gets no replies; janitor after 5 min"
 
 
+async def t18_voice(h: Harness, ctx: dict) -> str:
+    if not h.bot.voice:
+        return "skipped: VOICE_ENGINE / .venv-voice not installed"
+    sample = WORK / "voice-example.ogg"
+    if not sample.exists():   # a Russian speech sample published with GigaAM
+        import urllib.request
+        wav = WORK / "voice-example.wav"
+        urllib.request.urlretrieve("https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/example.wav", wav)
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(wav), "-c:a", "libopus", "-b:a", "32k", str(sample)],
+                       check=True)
+        wav.unlink()
+    real_download = h.tg.download
+
+    async def download(file_id: str, dest: Path, max_bytes: int = 0) -> int:
+        shutil.copy(sample, dest)
+        return dest.stat().st_size
+    h.tg.download = download
+    try:
+        topic = await h.new_topic("Test V — voice")
+        m = h._msg(None, topic, OWNER, voice={"file_id": "V1", "duration": 11, "file_size": 45000,
+                                              "mime_type": "audio/ogg"})
+        await h.update({"message": m})
+        turn = await h.wait_idle(topic, 180)
+    finally:
+        h.tg.download = real_download
+    heard = [e["text"] for e in h.tg.edits if e["text"].startswith("🎙 <i>")]
+    check(heard and "Ничьих не требуя похвал" in heard[-1], f"transcript shown in the topic: {heard[-1:]}")
+    check("Ничьих не требуя похвал" in turn.prompt and "расшифровка голосового" in turn.prompt,
+          "the transcript is what Claude received")
+    check(turn.status == "done" and h.answers(topic), f"Claude answered: {turn.status}")
+    check(not list(h.m.inbox_dir(h.session(topic)).glob("voice-*")), "the recording is deleted after transcription")
+    await h.bot.voice.stop()
+    return f"voice → «{heard[-1][5:60]}…» → Claude answered; recording deleted"
+
+
 TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T3", "isolation", t3_isolation),
          ("T4+T5", "concurrency=5 + queue", t4_t5_concurrency_and_queue),
          ("T6", "same-session serialization", t6_serialization), ("T7", "service restart", t7_restart),
@@ -682,7 +718,8 @@ TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T
          ("T14", "VS Code sessions + full limits", t14_vscode_and_limits),
          ("T15", "live dashboard + clean General", t15_live_dashboard),
          ("T16", "pinned control panel instead of commands", t16_control_panel),
-         ("T17", "General stays clean (sweep, no replies, janitor)", t17_clean_general)]
+         ("T17", "General stays clean (sweep, no replies, janitor)", t17_clean_general),
+         ("T18", "voice message → GigaAM → Claude", t18_voice)]
 
 
 async def main(selected: list[str]) -> int:

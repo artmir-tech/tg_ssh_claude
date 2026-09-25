@@ -50,6 +50,8 @@ class Config:
     data_dir: Path = ROOT / "data"
     tg_api_base: str = "https://api.telegram.org"
     timezone: str | None = None         # IANA name for times shown in Telegram; None = server time
+    voice_engine: str = ""              # "gigaam" = transcribe voice messages (needs .venv-voice); "" = off
+    voice_max_min: int = 15             # longer voice/audio is not transcribed
 
     @property
     def db_path(self) -> Path:
@@ -58,6 +60,10 @@ class Config:
     @property
     def inbox_root(self) -> Path:
         return self.data_dir / "inbox"
+
+    @property
+    def voice_python(self) -> Path:
+        return ROOT / ".venv-voice" / "bin" / "python"
 
     @property
     def secret_paths(self) -> list[Path]:
@@ -90,6 +96,8 @@ def load_config(env_file: Path | None = None) -> Config:
         data_dir=Path(get("DATA_DIR", str(ROOT / "data"))),
         tg_api_base=get("TELEGRAM_API_BASE", "https://api.telegram.org"),
         timezone=get("TIMEZONE") or None,
+        voice_engine=get("VOICE_ENGINE").lower(),
+        voice_max_min=int(get("VOICE_MAX_MIN", "15")),
     )
     if cfg.default_cwd not in cfg.project_dirs:
         cfg.project_dirs.insert(0, cfg.default_cwd)

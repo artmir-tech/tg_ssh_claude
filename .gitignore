@@ -2,6 +2,7 @@
 .env
 data/
 .venv/
+.venv-voice/
 __pycache__/
 tests/work/
 tests/report.json

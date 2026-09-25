@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 NAME="claude-control.tar.gz"   # fixed name: instructions and updates always use the same path
 mkdir -p dist
 tar -C "$HOME" -czf "dist/$NAME" \
-  --exclude='claude-control/.env' --exclude='claude-control/data' --exclude='claude-control/.venv' \
+  --exclude='claude-control/.env' --exclude='claude-control/data' --exclude='claude-control/.venv' --exclude='claude-control/.venv-voice' \
   --exclude='__pycache__' --exclude='claude-control/tests/work' --exclude='claude-control/tests/report.json' \
   --exclude='claude-control/tests/last-run.log' --exclude='claude-control/dist' --exclude='claude-control/docs' \
   claude-control
