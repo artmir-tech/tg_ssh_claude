@@ -256,7 +256,8 @@ bash ~/claude-control/deploy/install.sh          # переустановить 
   блокируется или приходит вам кнопками. Режим `auto` есть у Opus и Sonnet; у Haiku его нет — Claude спрашивает.
   В режиме «Спрашивать всё» (`default`) без вопросов — только чтение файлов и `AUTO_ALLOW_TOOLS`.
   `bypassPermissions` / `--dangerously-skip-permissions` не используются никогда (даже если записаны в `.env`).
-  «Не спрашивать про … здесь» действует только в этой теме и не меняет настройки Claude Code.
+  «Не спрашивать про … здесь» действует только в этой теме и не меняет настройки Claude Code; сбросить —
+  «🧹 Сбросить «♾ без вопросов»» в «ℹ️ О сессии».
 - `.env` и база бота закрыты для инструментов Claude (Read/Edit/Write).
 - Секреты никогда не уходят в Telegram, даже по вашей просьбе: `.env`, SSH-ключи, `*.pem`/`*.key`, вход Claude
   (`.credentials.json`, `.claude.json`), токен GitHub (`~/.config/gh`), данные бота. Файлы вне рабочей папки сессии
@@ -299,7 +300,9 @@ Telegram (long polling) ─> bot.py ─> manager.py ─> claude.py ─> claude C
   `ClaudeAgentOptions.permission_mode`; всё, что Claude Code решил спросить, приходит в `can_use_tool` → кнопки.
   Смена режима во время работы — `ClaudeSDKClient.set_permission_mode()` (кнопка «🤖 Разрешить и включить Авто»
   действует сразу). «Не спрашивать здесь» хранится в `sessions.grants` и передаётся следующим ходам как
-  `allowed_tools` (в файлы настроек не пишется). `AskUserQuestion` → кнопки вариантов.
+  `allowed_tools` (в файлы настроек не пишется); в «О сессии» — одной строкой (`grants_summary`).
+  `AskUserQuestion` → кнопки вариантов. Сообщение длиннее лимита Telegram (4096 символов) не теряется:
+  `TelegramAPI` отправляет его сокращённым (тесты проверяют, что до этого не доходит).
 - **VS Code.** `~/.claude/sessions/<pid>.json` (их пишет сам Claude Code, бот только читает) — какие сессии открыты
   и заняты. Сообщение из Telegram в сессию, занятую в VS Code, ждёт её освобождения.
 - **Лимиты.** Два источника, по каждому окну берётся более свежий: `RateLimitEvent` из запусков бота и кеш Claude Code

@@ -844,6 +844,25 @@ async def t20_permission_modes(h: Harness, ctx: dict) -> str:
         closed = [x for x in h.tg.edits if x["message_id"] == req["message_id"]]
         check(closed and "режим Авто" in closed[-1]["text"], "the verdict says Auto was switched on")
         check("🛡 Разрешения: 🤖 Авто" in h.bot.session_card(h.session(topic)), "«О сессии» shows the mode")
+
+        # many «Не спрашивать про … здесь» (a long working day): «О сессии» stays short and can reset them
+        grants = [{"rule": f"Bash(grep -n pattern{i} file{i}.py)"} for i in range(40)] + [
+            {"rule": "Bash(.venv/bin/python -m pyflakes x.py)"}, {"rule": "Skill(claude-api)"},
+            {"rule": "Skill(claude-api:*)"}, {"mode": "acceptEdits"}, {"rule": "Read(//tmp/**)"}]
+        h.db.update_session(s.id, grants=json.dumps(grants))
+        card = h.bot.session_card(h.session(topic))
+        line = next(x for x in card.splitlines() if x.startswith("♾"))
+        check(len(line) < 140 and "41 команда (grep, python)" in line and line.count("claude-api") == 1,
+              f"grants in one short line: {line!r}")
+        await h.press(f"pv:{s.id}:info", thread=topic)
+        reset = [b["callback_data"] for r in h.tg.edits[-1]["buttons"] for b in r if b["callback_data"].endswith(":grants")]
+        check(reset, "«О сессии» offers a reset")
+        await h.press(reset[0], thread=topic)
+        check(h.session(topic).grant_list == [] and "♾" not in h.tg.edits[-1]["text"], "reset forgets them")
+        # a message longer than Telegram allows is shortened, not lost
+        msg = await h.tg.send_message(CHAT, "<b>x</b>" + "слово " * 1200, thread_id=topic)
+        check(msg and len(h.tg.sent[-1]["text"]) <= 4096 and "сокращено" in h.tg.sent[-1]["text"], "too long -> shortened")
+        h.tg.too_long.clear()
     finally:
         h.cfg.permission_mode = "default"
         h.auto_approve = True
@@ -900,6 +919,11 @@ async def main(selected: list[str]) -> int:
                             "sec": round(time.time() - t0)})
             log(f"❌ {code} FAIL: {e}")
             traceback.print_exc()
+    if h.tg.too_long:
+        failed += 1
+        RESULTS.append({"test": "LEN", "name": "no message over Telegram limits", "ok": False,
+                        "evidence": f"rejected as too long: {h.tg.too_long}", "sec": 0})
+        log(f"❌ LEN FAIL: messages over Telegram limits: {h.tg.too_long}")
     await h.close()
     (ROOT / "report.json").write_text(json.dumps(RESULTS, ensure_ascii=False, indent=1))
     if os.environ.get("KEEP_SESSIONS") != "1":

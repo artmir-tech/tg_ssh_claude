@@ -160,6 +160,44 @@ def grant_label(g: dict) -> str:
     return f"«{clip(content, 30)}»" if tool == "Bash" else f"{tool_action(tool)}: {clip(content, 30)}"
 
 
+def rule_command(rule_content: str) -> str:
+    """'.venv/bin/python -m pyflakes x:*' -> 'python'; 'grep -n foo' -> 'grep'."""
+    words = [w for w in rule_content.removesuffix(":*").split() if w != "env" and not w.startswith("-") and "=" not in w]
+    name = Path(words[0]).name if words else "?"
+    return re.sub(r"\d+(\.\d+)*$", "", name) or name   # python3.12 -> python
+
+
+def grants_summary(grants: list[dict]) -> str:
+    """«Не спрашивать про … здесь» in one short line: '38 команд (grep, python, env и др.), правка файлов'."""
+    commands, sites, dirs, other = [], [], [], []
+    for g in grants:
+        m = re.match(r"^(\w+)\((.*)\)$", g.get("rule", ""))
+        if m and m.group(1) == "Bash":
+            commands.append(rule_command(m.group(2)))
+        elif m and m.group(2).startswith("domain:"):
+            sites.append(m.group(2)[7:])
+        elif "dir" in g:
+            dirs.append(Path(g["dir"]).name)
+        elif m and m.group(1) in ("Read", "Edit", "Write") and m.group(2):
+            dirs.append(m.group(2).removeprefix("/").removesuffix("/**").removesuffix("/*") or "/")
+        else:
+            label = f"навык {m.group(2).removesuffix(':*')}" if m and m.group(1) == "Skill" else grant_label(g)
+            if label not in other:
+                other.append(label)
+
+    def some(items: list[str], n: int = 3) -> str:
+        items = list(dict.fromkeys(items))
+        return ", ".join(items[:n]) + (" и др." if len(items) > n else "")
+    out = []
+    if commands:
+        out.append(f"{plural(len(commands), 'команда', 'команды', 'команд')} ({some(commands)})")
+    if sites:
+        out.append("сайты: " + some(sites))
+    if dirs:
+        out.append("папки: " + some(dirs))
+    return ", ".join(out + other[:4] + ([f"ещё {len(other) - 4}"] if len(other) > 4 else []))
+
+
 def shown_name(path: str) -> str:
     """Saved inbox files are '<date>-<time>_<name>'; show the user's own name."""
     name = Path(path).name
@@ -1106,7 +1144,7 @@ class Bot:
         lines.append("📎 Файлы, которые делает Claude: " + ("приходят сюда сами" if s.send_files else "не присылаются "
                                                             "(можно попросить «пришли файл»)"))
         if s.grant_list:
-            lines.append("Без вопросов в этой теме: " + esc(", ".join(grant_label(g) for g in s.grant_list)))
+            lines.append("♾ Без вопросов в этой теме: " + esc(grants_summary(s.grant_list)))
         lines += ["", "<blockquote expandable>💻 <b>Открыть на компьютере</b>\n"
                   f"VS Code → история разговоров Claude → «{esc(clip(s.title, 40))}»\nТерминал:\n"
                   f"<code>cd {esc(s.cwd)} &amp;&amp; claude --resume {s.claude_session_id}</code></blockquote>"]
@@ -1128,7 +1166,10 @@ class Bot:
         """Screens of the pinned panel. Every sub-screen has «◂ Назад»; irreversible actions ask first."""
         back = [btn("◂ Назад", f"pv:{s.id}:main")]
         if view == "info":
-            return self.session_card(s), [[btn("🔄 Обновить", f"pv:{s.id}:info"), back[0]]]
+            rows = [[btn("🔄 Обновить", f"pv:{s.id}:info"), back[0]]]
+            if s.grant_list:
+                rows.insert(0, [btn("🧹 Сбросить «♾ без вопросов»", f"pa:{s.id}:grants")])
+            return self.session_card(s), rows
         if view == "model":
             cur = s.model or self.cfg.model
             mark = lambda name: ("✅ " if cur == name else "") + name.capitalize()  # noqa: E731
@@ -1544,7 +1585,7 @@ class Bot:
         if name == "Bash":
             out = f"<pre>{esc(clip_block(inp.get('command', ''), 1500))}</pre>"
             if inp.get("description"):
-                out += f"\n<i>{esc(inp['description'])}</i>"
+                out += f"\n<i>{esc(clip(inp['description'], 200))}</i>"
             return out
         if name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
             path = Path(inp.get("file_path") or inp.get("notebook_path") or "")
@@ -1783,6 +1824,10 @@ class Bot:
         if what == "ren":
             await self.ask_new_title(s, mid)
             return "Напишите новое название сообщением"
+        if what == "grants":   # forget every «Не спрашивать про … здесь» of this topic
+            self.db.update_session(s.id, grants="[]")
+            await self.show_panel(self.db.get_session(s.id), "info", mid)
+            return "Сброшено — про эти действия Claude снова спросит (в режиме Авто — только про рискованные)"
         if what == "perm":
             await self.m.set_session_mode(s.id, arg)
             await self.show_panel(self.db.get_session(s.id), "main", mid)
@@ -1960,7 +2005,8 @@ def html_chunks(markdown: str) -> list[str]:
 def grant_label_from(req: PendingRequest) -> str:
     from .claude import grants_from_suggestions
     grants = grants_from_suggestions(req.ctx) if req.ctx else []
-    return ", ".join(grant_label(g) for g in grants) or tool_action(req.tool_name)
+    return (grants_summary(grants) if len(grants) > 2 else ", ".join(grant_label(g) for g in grants)) \
+        or tool_action(req.tool_name)
 
 
 def clip_block(text: str, n: int) -> str:

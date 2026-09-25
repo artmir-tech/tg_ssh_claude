@@ -143,6 +143,11 @@ class TelegramAPI:
         try:
             return await self.call("sendMessage", **params)
         except TelegramError as e:
+            if "too long" in e.description:   # a bug elsewhere must not lose the message: send it shortened
+                log.warning("message too long (%d chars) - sent shortened", len(text))
+                params.pop("parse_mode", None)
+                params["text"] = _fit(_strip_tags(text) if html else text)
+                return await self.call("sendMessage", **params)
             if html and "parse entities" in e.description:
                 # Our Markdown->HTML conversion produced something Telegram rejects: send raw text.
                 params.pop("parse_mode")
@@ -159,6 +164,11 @@ class TelegramAPI:
             return res is not None
         except TelegramError as e:
             if "not modified" in e.description:
+                return True
+            if "too long" in e.description:
+                log.warning("edit too long (%d chars) - shortened", len(text))
+                await self.call("editMessageText", chat_id=chat_id, message_id=message_id,
+                                text=_fit(_strip_tags(text)), reply_markup={"inline_keyboard": buttons or []})
                 return True
             if "parse entities" in e.description:
                 await self.call("editMessageText", chat_id=chat_id, message_id=message_id, text=_strip_tags(text),
@@ -234,6 +244,10 @@ class TelegramAPI:
             raise ConnectionError(self.redact(f"download failed: {type(e).__name__}")) from None
         dest.write_bytes(resp.content)
         return len(resp.content)
+
+
+def _fit(text: str, limit: int = 4000) -> str:
+    return text if len(text) <= limit else text[: limit - 30].rstrip() + "\n… (сообщение сокращено)"
 
 
 def _strip_tags(html_text: str) -> str:

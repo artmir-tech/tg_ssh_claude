@@ -27,9 +27,18 @@ class FakeTelegram(TelegramAPI):
         self.can_manage_topics = True
         self.user_msgs: dict[int, tuple[str, int]] = {}   # injected user messages: id -> (text, user id)
         self.deleted_topics: list[int] = []
+        self.too_long: list[str] = []     # rejected as too long (the bot must never rely on that)
 
     async def call(self, method: str, *, droppable: bool = False, _files: dict | None = None, **p: Any) -> Any:
         self.calls.append(method)
+        # like Telegram: limits apply to the visible text (after HTML parsing)
+        for key, limit in (("text", 4096), ("caption", 1024)):
+            if isinstance(p.get(key), str):
+                visible = _strip_tags(p[key]) if p.get("parse_mode") == "HTML" else p[key]
+                if len(visible) > limit:
+                    self.too_long.append(method)
+                    raise TelegramError(method, 400, f"Bad Request: message {'caption ' if key == 'caption' else ''}"
+                                                     "is too long")
         if method == "getMe":
             return {"id": 1, "is_bot": True, "username": "test_bot"}
         if method in ("sendMessage", "sendDocument", "sendMediaGroup"):
