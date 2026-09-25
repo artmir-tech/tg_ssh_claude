@@ -913,6 +913,7 @@ async def t21_general_route(h: Harness, ctx: dict) -> str:
     await h.say(topic, "Запомни слово ROUTE-9. Ответь: OK")
     await h.wait_idle(topic)
     s = h.session(topic)
+    await h.press("route:unstick")   # an earlier test sent from General minutes ago: start from «ask»
     n = len(h.tg.sent)
     msg = await h.say(None, "Какое слово я просил запомнить? Ответь только им.")
     dash = int(h.db.kv_get("dashboard_msg_id"))
@@ -926,7 +927,21 @@ async def t21_general_route(h: Harness, ctx: dict) -> str:
     await h.wait_idle(topic)
     check(any(m["text"].startswith("✉️ <i>Из General") for m in h.tg.in_topic(topic)), "the topic shows what was written")
     check("ROUTE-9" in h.answers(topic)[-1].upper(), f"it continued that conversation: {h.answers(topic)[-1]!r}")
-    check("Отправлено" in [x for x in h.tg.edits if x["message_id"] == dash][-1]["text"], "the dashboard confirms")
+    check("Отправлено" in dash_text(h), "the dashboard confirms")
+
+    # a follow-up written in General right after: same topic, no question
+    n_turns = len(h.turns(topic))
+    await h.say(None, "И повтори его ещё раз, только маленькими буквами.")
+    check(len(h.turns(topic)) == n_turns + 1 and not h.bot._route, "a follow-up goes to the same topic without asking")
+    await h.wait_idle(topic)
+    check("route-9" in h.answers(topic)[-1], f"Claude continued: {h.answers(topic)[-1]!r}")
+    await h.bot.refresh_dashboard()
+    check("сообщения уходят в" in dash_text(h), "the dashboard says where General messages go now")
+    await h.press("route:unstick", message_id=dash)
+    await h.say(None, "это уже другое")
+    check("Куда отправить" in dash_text(h) and "Отправлено" not in dash_text(h),
+          "after «Не отправлять» it asks again; the old «Отправлено» line is not mixed into the question")
+    await h.press("route:x", message_id=dash)
 
     before = set(h.tg.topics)
     await h.say(None, "Reply exactly: NEW-FROM-GENERAL")
@@ -936,11 +951,13 @@ async def t21_general_route(h: Harness, ctx: dict) -> str:
     await h.wait_idle(new[0])
     check("NEW-FROM-GENERAL" in h.answers(new[0])[-1], "Claude got the task in the new topic")
 
+    await h.press("route:unstick", message_id=dash)
     await h.say(None, "не туда")
     await h.press("route:x", message_id=dash)
     check(not h.bot._route and "Куда отправить" not in [x for x in h.tg.edits if x["message_id"] == dash][-1]["text"],
           "«Отменить» drops the message")
-    return "General message → chosen topic (continued its conversation) / new topic named by it / cancel; General stays clean"
+    return ("General message → chosen topic (continued its conversation); follow-ups go there without asking until "
+            "«Не отправлять»; new topic named by it; cancel; General stays clean")
 
 
 TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T3", "isolation", t3_isolation),

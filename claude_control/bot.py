@@ -42,6 +42,7 @@ DASH_MIN_GAP_S = 8           # ...and at most this often when things change
 DASH_VIEW_RESET_S = 600      # a non-main view falls back to the main one after 10 min
 SHORT_TTL = 60               # service notices in topics ("renamed", "stopped"...) disappear after this
 USAGE_REFRESH_S = 300        # how often Claude Code's usage (limits) cache is refreshed
+STICKY_S = 300               # after «Куда отправить?» → a topic, more messages from General go there for 5 min
 FLASH_S = 60                 # a notice line on top of the dashboard stays this long
 GENERAL_IDLE_CLEAN_S = 300   # General is swept this long after its last activity
 RENAME_WAIT_S = 600          # after «Переименовать», the next message within this time becomes the title
@@ -248,6 +249,7 @@ class Bot:
         self._flash: tuple[str, float] = ("", 0.0)
         self._route: list[dict] = []            # messages written in General, waiting for «Куда отправить?»
         self._route_at = 0.0
+        self._sticky: tuple[int, float] = (0, 0.0)   # (session id, until): follow-ups from General go there
         self.voice: Transcriber | None = None
         self._albums: dict[str, dict] = {}      # media_group_id -> files collected from one Telegram album
         if cfg.voice_engine == "gigaam":
@@ -445,9 +447,22 @@ class Bot:
         else:   # text, voice, a file: keep it and ask which topic it is for
             if time.time() - self._route_at > DASH_VIEW_RESET_S:
                 self._route = []
+            target = self.sticky_session()
+            if target and not self._route:   # a follow-up right after sending one: same topic, no question
+                self._route = [m]
+                log.info("General message follows up in session %s", target.id)
+                await self.route_to(str(target.id))
+                return
             self._route.append(m)
             self._route_at = time.time()
+            self._flash = ("", 0.0)   # «Отправлено в …» of the previous message must not look like an answer
+            log.info("General message held: %d waiting for «Куда отправить?»", len(self._route))
             await self.refresh_dashboard(view="route")
+
+    def sticky_session(self) -> D.Session | None:
+        sid, until = self._sticky
+        s = self.db.get_session(sid) if sid and time.time() < until else None
+        return s if s and s.topic_id and not s.archived else None
 
     def route_view(self) -> tuple[str, list[list[dict]]]:
         """«Куда отправить?» for what the owner wrote in General: a new topic or one of the recent ones."""
@@ -470,6 +485,10 @@ class Bot:
 
     async def route_to(self, choice: str) -> str:
         """Send what was written in General into a topic, exactly as if it had been written there."""
+        if choice == "unstick":   # «✖ Не отправлять в …»: the next message asks again
+            self._sticky = (0, 0.0)
+            await self.refresh_dashboard(view="main")
+            return "Следующее сообщение — с выбором темы"
         msgs, self._route = self._route, []
         self.db.kv_set("dashboard_view", "main")
         if not msgs or choice == "x":
@@ -504,6 +523,8 @@ class Bot:
             moved.update(message_thread_id=s.topic_id, is_topic_message=True,
                          message_id=echo["message_id"] if echo else x["message_id"])
             await self._topic(moved, s.topic_id, None, "", text)
+        self._sticky = (s.id, time.time() + STICKY_S)
+        log.info("General message(s) sent to session %s", s.id)
         await self.flash(f'✉️ Отправлено в <a href="{self.topic_link(s.topic_id)}">{esc(s.title)}</a>')
         return f"Отправлено в «{clip(s.title, 40)}»"
 
@@ -806,6 +827,12 @@ class Bot:
                    [btn("📋 Все сессии", "dash:all"), btn("📈 Лимиты", "dash:limits")]]
         if vs_busy or vs_only_free:
             buttons.append([btn("📥 Подключить из VS Code", "dash:import:0")])
+        target = self.sticky_session()
+        if target:   # follow-ups from General go to this topic for a few minutes
+            left = max(1, round((self._sticky[1] - time.time()) / 60))
+            lines.insert(1, f'✉️ Пишете сюда — сообщения уходят в <a href="{self.topic_link(target.topic_id)}">'
+                            f'{esc(clip(target.title, 40))}</a> (ещё {left} мин)')
+            buttons.insert(0, [btn(f"✖ Не отправлять в «{clip(target.title, 22)}»", "route:unstick")])
         return "\n".join(lines), buttons
 
     def _dashboard_all(self, sessions: list[D.Session], live: dict[str, dict], legend: str) -> str:
