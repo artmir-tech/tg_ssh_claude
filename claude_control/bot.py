@@ -1124,10 +1124,14 @@ class Bot:
             if req:
                 text += ("\n🔐 Сначала Claude ждёт вашего решения выше ↑" if req.kind == "perm"
                          else "\n❓ Сначала Claude ждёт ответа на вопрос выше ↑")
-        else:
+        elif self.m.restart_pending():
+            text = "🔄 Бот обновляется. Ваше сообщение выполнится сразу после перезапуска — обычно через пару минут."
+        elif len(self.m.active) >= self.cfg.max_concurrent:
             pos = self.m.queue_position(s.id) or 1
             text = (f"🟡 В очереди — {ordinal(pos)}.\nСейчас работают {self.cfg.max_concurrent} задач (это максимум). "
                     "Начну, как только одна закончится.")
+        else:
+            text = "🟡 В очереди. Начну через несколько секунд."
         msg = await self._send_topic(s, text, reply_to=turn.message_id, silent=True)
         if not msg:
             return

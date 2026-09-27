@@ -889,6 +889,8 @@ async def t20_permission_modes(h: Harness, ctx: dict) -> str:
         await asyncio.sleep(2)
         check(h.turns(topic2)[-1].status == "queued" and h.session(topic2).id not in h.m.active,
               "while a restart is pending new tasks wait in the queue")
+        note = [m["text"] for m in h.tg.in_topic(topic2) if m["text"].startswith(("🔄", "🟡"))]
+        check(note and note[-1].startswith("🔄 Бот обновляется"), f"the queue notice says why it waits: {note}")
         await h.m.recover()   # what the new version does on start: removes the flag, starts the queue
         check(not h.cfg.restart_flag.exists(), "the new version removes the flag")
         turn = await h.wait_idle(topic2, 120)

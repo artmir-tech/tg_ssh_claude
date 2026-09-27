@@ -5,8 +5,9 @@ Telegram manager for Claude Code sessions (one forum topic = one session). Read 
 - Service: `systemctl --user {status|restart} claude-control`; logs: `journalctl --user -u claude-control -n 200`.
 - After code changes: run the tests, then `systemctl --user restart claude-control` - or, when working from a
   Telegram topic (you run inside the service!), `systemd-run --user --unit=claude-control-restart --collect bash ~/claude-control/deploy/restart-when-idle.sh`
-  (absolute path: systemd-run does not start in the project folder). It holds new tasks while running ones finish,
-  so the queue runs on the new version; never wait for an empty queue (the owner keeps writing).
+  (absolute path: systemd-run does not start in the project folder). It holds new tasks for up to 3 minutes while
+  running ones finish (the queue then runs on the new version); a long task releases the hold and the restart
+  happens at the first idle moment. Never wait for an empty queue (the owner keeps writing).
   (running tasks get a "Continue" button in Telegram).
 - Tests (real Claude, haiku): `env -i HOME=$HOME PATH=/usr/bin:/bin LANG=C.UTF-8 .venv/bin/python -m tests.acceptance`
 - Never use bypassPermissions / --dangerously-skip-permissions; never edit transcripts in ~/.claude/projects.
