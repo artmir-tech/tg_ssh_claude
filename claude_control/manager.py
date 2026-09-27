@@ -28,7 +28,8 @@ from . import db as D
 from .claude import (ClaudeTurn, TurnOutcome, build_permission_result, grants_from_suggestions, live_sessions,
                      transcript_exists)
 from .config import PERMISSION_MODES, Config, safe_mode
-from .files import SERVER_NAME, SEND_TOOL, auto_sendable, is_secret, resolve, send_tool_server
+from .files import SERVER_NAME, SEND_TOOL, TRANSCRIBE_TOOL, auto_sendable, is_secret, resolve, send_tool_server
+from .voice import transcribe_file
 
 log = logging.getLogger("cc.manager")
 RESTART_FLAG_TTL_S = 2 * 3600   # deploy/restart-when-idle.sh gives up after 1 hour
@@ -229,7 +230,7 @@ class Manager:
         return dict(
             model=s.model or self.cfg.model,
             permission_mode=mode,
-            allowed_tools=self.cfg.auto_allow_tools + [g["rule"] for g in grants if "rule" in g],
+            allowed_tools=self.cfg.auto_allow_tools + [TRANSCRIBE_TOOL] + [g["rule"] for g in grants if "rule" in g],
             disallowed_tools=deny,
             add_dirs=[str(self.inbox_dir(s))] + [g["dir"] for g in grants if "dir" in g],
         )
@@ -253,7 +254,7 @@ class Manager:
                     cli_path=self.cfg.claude_cli, cwd=s.cwd, claude_session_id=s.claude_session_id,
                     resume=resume, prompt=turn.prompt, max_seconds=self.cfg.max_run_hours * 3600,
                     on_event=self._event_handler(ar, turn), can_use_tool=self._permission_handler(ar),
-                    mcp_servers={SERVER_NAME: send_tool_server(self._file_sender(ar))},
+                    mcp_servers={SERVER_NAME: send_tool_server(self._file_sender(ar), self._transcriber(ar))},
                     **self._claude_options(s))
                 log.info("claude run session=%s claude=%s mode=%s", sid, s.claude_session_id[:8],
                          "resume" if resume else "new")
@@ -338,6 +339,19 @@ class Manager:
                                             ar=ar, requested=True)
         return send
 
+    def _transcriber(self, ar: ActiveRun):
+        voice = getattr(self.ui, "voice", None)
+        if voice is None:
+            return None
+
+        async def transcribe(path: str, timestamps: bool) -> str:   # the transcribe tool: nothing leaves the server
+            s = self.db.get_session(ar.session_id)
+            p = resolve(path, s.cwd)
+            if is_secret(p):
+                return "Error: this file holds secrets and is not processed."
+            return await transcribe_file(voice, p, timestamps, self.inbox_dir(s))
+        return transcribe
+
     def _in_session_dirs(self, s: D.Session, p: Path) -> bool:
         return p.is_relative_to(Path(s.cwd).resolve()) or p.is_relative_to(self.inbox_dir(s).resolve())
 
@@ -388,6 +402,8 @@ class Manager:
                     return PermissionResultDeny(message="This file holds secrets (keys, tokens, logins) and is "
                                                         "never sent out of the server.")
                 return PermissionResultAllow()   # files from elsewhere: the tool itself asks the owner (_file_sender)
+            if tool_name == TRANSCRIBE_TOOL:   # reads a recording, writes a .txt next to it; nothing leaves
+                return PermissionResultAllow()
             return await self._ask_owner(ar, tool_name, inp, ctx)
         return can_use_tool
 

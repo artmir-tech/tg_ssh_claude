@@ -1,5 +1,5 @@
 """Files from the server to Telegram: which files may leave the server, which are sent on their
-own, and the `send_file` tool Claude can call.
+own, and the tools Claude can call: `send_file` and (with voice on) `transcribe`.
 
 Sending a file to Telegram takes it off the server, so:
   * secrets never leave (even if the owner approves): .env files, SSH keys, Claude/GitHub logins,
@@ -21,6 +21,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 
 SERVER_NAME = "claude_control"
 SEND_TOOL = f"mcp__{SERVER_NAME}__send_file"
+TRANSCRIBE_TOOL = f"mcp__{SERVER_NAME}__transcribe"
 
 _SECRET_NAMES = (".env", ".env.*", "*.env", "id_rsa*", "id_ed25519*", "id_ecdsa*", "*.pem", "*.key", "*.p12",
                  ".netrc", ".git-credentials", ".credentials.json", ".claude.json")
@@ -74,8 +75,10 @@ def zip_files(paths: list[Path], dest_dir: Path) -> Path:
     return dest
 
 
-def send_tool_server(send: Callable[[str, str], Awaitable[str]]) -> Any:
-    """An in-process MCP server with one tool; `send(path, caption)` delivers the file to the topic."""
+def send_tool_server(send: Callable[[str, str], Awaitable[str]],
+                     transcribe: Callable[[str, bool], Awaitable[str]] | None = None) -> Any:
+    """An in-process MCP server: `send(path, caption)` delivers a file to the topic;
+    `transcribe(path, timestamps)` turns speech into text on the server (only when voice is on)."""
 
     @tool("send_file",
           "Send a file from the server to the user's Telegram chat (this conversation's topic). Use it when the "
@@ -88,4 +91,18 @@ def send_tool_server(send: Callable[[str, str], Awaitable[str]]) -> Any:
         text = await send(args["path"], args.get("caption") or "")
         return {"content": [{"type": "text", "text": text}], "is_error": text.startswith("Not sent")}
 
-    return create_sdk_mcp_server(SERVER_NAME, tools=[send_file])
+    @tool("transcribe",
+          "Speech to text for an audio or video file on this server (GigaAM v3 - local speech recognition, "
+          "best for Russian; ~5-8 minutes of recording per minute). Use it whenever you need what is said in "
+          "a recording (voice notes, calls, meetings, lectures, mp4/mov/mp3/m4a/ogg/wav...) - do not install "
+          "Whisper or other speech models. The full text is saved to '<name>.расшифровка.txt' next to the file.",
+          {"type": "object",
+           "properties": {"path": {"type": "string", "description": "Absolute path, or relative to the working directory"},
+                          "timestamps": {"type": "boolean", "description": "Prefix each piece (~20 s) with "
+                                         "[mm:ss-mm:ss] - useful to match speech with video frames"}},
+           "required": ["path"]})
+    async def transcribe_tool(args: dict) -> dict:
+        text = await transcribe(args["path"], bool(args.get("timestamps")))
+        return {"content": [{"type": "text", "text": text}], "is_error": text.startswith("Error")}
+
+    return create_sdk_mcp_server(SERVER_NAME, tools=[send_file] + ([transcribe_tool] if transcribe else []))

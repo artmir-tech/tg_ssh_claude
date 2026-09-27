@@ -123,7 +123,7 @@ TOOL_ACTIONS = {"Bash": "выполнить команду", "Write": "запи�
                 "MultiEdit": "изменить файл", "NotebookEdit": "изменить блокнот", "WebFetch": "открыть сайт",
                 "WebSearch": "искать в интернете", "ExitPlanMode": "перейти от плана к работе",
                 "Agent": "запустить помощника", "Task": "запустить помощника", "Skill": "запустить навык",
-                SEND_TOOL: "прислать вам файл"}
+                SEND_TOOL: "прислать вам файл", "mcp__claude_control__transcribe": "расшифровать запись"}
 
 
 def tool_action(name: str) -> str:

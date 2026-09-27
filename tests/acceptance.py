@@ -960,6 +960,45 @@ async def t21_general_route(h: Harness, ctx: dict) -> str:
             "«Не отправлять»; new topic named by it; cancel; General stays clean")
 
 
+async def t22_transcribe_tool(h: Harness, ctx: dict) -> str:
+    if not h.bot.voice:
+        return "skipped: VOICE_ENGINE / .venv-voice not installed"
+    sample = WORK / "voice-example.ogg"
+    check(sample.exists(), "T18 downloads the speech sample first")
+    tdir = Path.home() / f"cc-transcribe-test-{os.getpid()}"
+    tdir.mkdir(exist_ok=True)
+    try:
+        video = tdir / "meeting.mp4"   # a video file with speech, like one sent from Telegram
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=black:s=160x120:r=5", "-i", str(sample),
+                        "-shortest", "-c:v", "libx264", "-c:a", "aac", str(video)], check=True)
+        topic = await h.new_topic("Test T — transcribe")
+        s = h.m.create_session(CHAT, topic, "Test T — transcribe", cwd=str(tdir))
+        CREATED_SESSIONS.add(s.claude_session_id)
+        await h.say(topic, "Use your transcribe tool on meeting.mp4 with timestamps. Then reply with the first four "
+                           "words of the transcript and nothing else.")
+        turn = await h.wait_idle(topic, 240)
+        out = tdir / "meeting.расшифровка.txt"
+        check(out.exists(), f"transcript saved next to the video: {sorted(x.name for x in tdir.iterdir())}")
+        text = out.read_text()
+        check("Ничьих не требуя похвал" in text and text.startswith("[00:00-"), f"GigaAM text with timestamps: {text[:80]!r}")
+        check(not [m for m in h.tg.in_topic(topic) if m["text"].startswith("🔐")], "no permission request needed")
+        answers = h.answers(topic)
+        check(turn.status == "done" and answers and "похвал" in answers[-1].lower(), f"Claude used it: {answers[-1:]}")
+        check(out.name not in [f for m in h.tg.in_topic(topic) for f in m.get("files", [])],
+              "the transcript is not sent to the chat by itself")
+    finally:
+        await h.bot.voice.stop()
+        shutil.rmtree(tdir, ignore_errors=True)
+        proj = Path.home() / ".claude/projects" / ("-" + str(tdir).strip("/").replace("/", "-"))
+        for sid in list(CREATED_SESSIONS):
+            try:
+                delete_session(sid, directory=str(tdir))
+            except Exception:  # noqa: BLE001
+                pass
+        shutil.rmtree(proj, ignore_errors=True)
+    return f"video → transcribe tool (no approval) → {out.name}: «{text[:60]}…»; Claude answered «{answers[-1][:40]}»"
+
+
 TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T3", "isolation", t3_isolation),
          ("T4+T5", "concurrency=5 + queue", t4_t5_concurrency_and_queue),
          ("T6", "same-session serialization", t6_serialization), ("T7", "service restart", t7_restart),
@@ -974,7 +1013,8 @@ TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T
          ("T18", "voice message → GigaAM → Claude", t18_voice),
          ("T19", "files: Claude → chat automatically, send_file, albums, limits", t19_files),
          ("T20", "permission modes: Auto by default, picker, switch from a request", t20_permission_modes),
-         ("T21", "message in General → «Куда отправить?» → topic", t21_general_route)]
+         ("T21", "message in General → «Куда отправить?» → topic", t21_general_route),
+         ("T22", "transcribe tool: audio/video file → GigaAM → Claude", t22_transcribe_tool)]
 
 
 async def main(selected: list[str]) -> int:

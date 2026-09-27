@@ -26,7 +26,8 @@ if grep -q '^VOICE_ENGINE=gigaam' .env; then
   [ -d .venv-voice ] || python3 -m venv .venv-voice
   .venv-voice/bin/pip install -q --upgrade pip
   .venv-voice/bin/pip install -q -r requirements-voice.txt
-  echo "Voice recognition installed (the model, ~430 MB, downloads on the first voice message)"
+  mkdir -p ~/.local/bin && ln -sf "$PWD/deploy/transcribe" ~/.local/bin/transcribe
+  echo "Voice recognition installed (the model, ~430 MB, downloads on the first voice message; 'transcribe FILE' in a terminal)"
 fi
 
 mkdir -p ~/.config/systemd/user

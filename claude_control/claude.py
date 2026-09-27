@@ -107,6 +107,8 @@ def tool_summary(name: str, inp: dict) -> str:
         return "📝 Планирует шаги"
     if name == "mcp__claude_control__send_file":
         return f"📎 Отправляет файл: {base(inp.get('path'))}"
+    if name == "mcp__claude_control__transcribe":
+        return f"🎙 Расшифровывает запись: {base(inp.get('path'))}"
     if name.startswith("mcp__"):
         return f"🔌 {name.split('__')[-1]}"
     return f"🛠 {name}"

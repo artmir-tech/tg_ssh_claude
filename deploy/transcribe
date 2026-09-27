@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Speech -> text for any audio/video file, locally (GigaAM v3, Russian). Uses the bot's .venv-voice.
+#   transcribe FILE [FILE...] [-t] [-o OUT.txt]      (-t = [mm:ss-mm:ss] timestamps)
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+[ -x "$ROOT/.venv-voice/bin/python" ] || { echo "Speech recognition is not installed: set VOICE_ENGINE=gigaam in $ROOT/.env and run deploy/install.sh" >&2; exit 1; }
+PYTHONPATH="$ROOT" exec "$ROOT/.venv-voice/bin/python" -m claude_control.voice "$@"
