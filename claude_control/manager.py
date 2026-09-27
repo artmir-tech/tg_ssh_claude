@@ -290,13 +290,20 @@ class Manager:
                      sid, turn.id, outcome.status, (outcome.duration_ms or 0) // 1000, outcome.cost_usd)
         except asyncio.CancelledError:
             # Service shutdown: leave the turn 'running' so recover() reports it after restart.
-            self.active.pop(sid, None)
+            self._release(ar)
             raise
         except Exception as e:  # noqa: BLE001
             log.exception("run crashed session=%s", sid)
             outcome = TurnOutcome(status="error", error="Внутренняя ошибка Claude Control.",
                                   details=f"{type(e).__name__}: {e}")
         await self._finish(ar, turn, outcome)
+
+    def _release(self, ar: ActiveRun) -> None:
+        """Remove this run from the active ones - only this one: while a finished run is being wrapped up,
+        the next message of the same topic may already have started (removing that one instead let a third
+        run start in parallel in the same session)."""
+        if self.active.get(ar.session_id) is ar:
+            del self.active[ar.session_id]
 
     async def _finish(self, ar: ActiveRun, turn: D.Turn, outcome: TurnOutcome) -> None:
         sid = ar.session_id
@@ -309,7 +316,7 @@ class Manager:
             for tid in ar.joined:   # follow-ups answered inside this run
                 self.db.update_turn(tid, status=outcome.status, finished_at=now, error=outcome.error)
             status = {"done": D.IDLE, "stopped": D.STOPPED}.get(outcome.status, D.ERROR)
-            self.active.pop(sid, None)
+            self._release(ar)
             self.set_status(sid, status, current_pid=None, run_started_at=None, last_activity_at=now,
                             last_error=outcome.error if status == D.ERROR else None)
             if self.db.queued_count(sid) and status != D.ERROR:
@@ -325,7 +332,7 @@ class Manager:
             elif not s.title_synced and s.title_source == "user":   # stopped/failed: still keep names in sync
                 await self.sync_title(s)
         finally:
-            self.active.pop(sid, None)
+            self._release(ar)
             self.schedule()
 
     def _event_handler(self, ar: ActiveRun, turn: D.Turn):

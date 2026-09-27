@@ -1026,6 +1026,36 @@ async def t23_background(h: Harness, ctx: dict) -> str:
     return f"message while waiting answered at once (background went on); Stop ended the wait in {took:.1f}s"
 
 
+async def t24_one_run_per_topic(h: Harness, ctx: dict) -> str:
+    """Regression: while a finished run was being wrapped up, the next one of the same topic could already start;
+    removing «the session's run» from the active list then removed the new one and a third started in parallel."""
+    topic = await h.new_topic("Test S — strictly one by one")
+    parallel: list[int] = []
+    orig_start, orig_finished = h.m._start, h.bot.run_finished
+
+    def start(turn):
+        if turn.session_id in h.m.active:
+            parallel.append(turn.id)
+        orig_start(turn)
+
+    async def run_finished(*a, **kw):
+        h.m.schedule()                      # something else schedules while this run is being wrapped up
+        await asyncio.sleep(0.3)
+        await orig_finished(*a, **kw)
+    h.m._start, h.bot.run_finished = start, run_finished
+    try:
+        for word in ("ONE", "TWO", "THREE"):
+            await h.say(topic, f"Reply exactly: {word}")
+        await h.wait(lambda: len(h.turns(topic)) == 3 and all(t.status == "done" for t in h.turns(topic)), 180,
+                     "three messages done")
+    finally:
+        h.m._start, h.bot.run_finished = orig_start, orig_finished
+    runs = [(t.started_at, t.finished_at) for t in h.turns(topic)]
+    overlap = any(b[0] < a[1] - 0.05 for a, b in zip(runs, runs[1:]))
+    check(not parallel and not overlap, f"never two runs of one topic at once: parallel={parallel} runs={runs}")
+    return "3 messages with a concurrent schedule() during wrap-up: strictly one after another"
+
+
 TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T3", "isolation", t3_isolation),
          ("T4+T5", "concurrency=5 + queue", t4_t5_concurrency_and_queue),
          ("T6", "same-session serialization", t6_serialization), ("T7", "service restart", t7_restart),
@@ -1042,7 +1072,8 @@ TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T
          ("T20", "permission modes: Auto by default, picker, switch from a request", t20_permission_modes),
          ("T21", "message in General → «Куда отправить?» → topic", t21_general_route),
          ("T22", "transcribe tool: audio/video file → GigaAM → Claude", t22_transcribe_tool),
-         ("T23", "background task: talk while waiting, Stop works", t23_background)]
+         ("T23", "background task: talk while waiting, Stop works", t23_background),
+         ("T24", "one run per topic even when scheduling races", t24_one_run_per_topic)]
 
 
 async def main(selected: list[str]) -> int:
