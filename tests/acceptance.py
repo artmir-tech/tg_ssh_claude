@@ -1058,6 +1058,25 @@ async def t24_one_run_per_topic(h: Harness, ctx: dict) -> str:
     return "3 messages with a concurrent schedule() during wrap-up: strictly one after another"
 
 
+async def t25_resume_after_killed_background(h: Harness, ctx: dict) -> str:
+    """Regression: after a background task was cut off (stop/restart/crash), the next run first gets an empty
+    replayed turn from Claude Code; treating it as the end killed Claude mid-work and the answer was lost."""
+    import signal
+    topic = await h.new_topic("Test K — after a cut-off background task")
+    await h.say(topic, "Use the Bash tool with run_in_background=true to run: sleep 45 && echo BG . "
+                       "Do not wait for it. Reply exactly: STARTED")
+    s = lambda: h.session(topic)  # noqa: E731
+    await h.wait(lambda: s().id in h.m.active and h.m.active[s().id].background and h.m.active[s().id].answers_sent,
+                 120, "waiting for the background task")
+    os.kill(h.m.active[s().id].claude.pid, signal.SIGTERM)    # the process is cut off (as by a crash or restart)
+    await h.wait_idle(topic, 60)
+    await h.say(topic, "Use the Bash tool to run: sleep 3; echo HELLO-25 . Then reply exactly: DONE-25")
+    turn = await h.wait_idle(topic, 120)
+    check(turn.status == "done" and any("DONE-25" in a for a in h.answers(topic)),
+          f"the next message is answered in full: {turn.status} {h.answers(topic)[-1:]!r}")
+    return "after a cut-off background task the next message got its full answer"
+
+
 TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T3", "isolation", t3_isolation),
          ("T4+T5", "concurrency=5 + queue", t4_t5_concurrency_and_queue),
          ("T6", "same-session serialization", t6_serialization), ("T7", "service restart", t7_restart),
@@ -1075,7 +1094,8 @@ TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T
          ("T21", "message in General → «Куда отправить?» → topic", t21_general_route),
          ("T22", "transcribe tool: audio/video file → GigaAM → Claude", t22_transcribe_tool),
          ("T23", "background task: talk while waiting, Stop works", t23_background),
-         ("T24", "one run per topic even when scheduling races", t24_one_run_per_topic)]
+         ("T24", "one run per topic even when scheduling races", t24_one_run_per_topic),
+         ("T25", "answer after a cut-off background task", t25_resume_after_killed_background)]
 
 
 async def main(selected: list[str]) -> int:

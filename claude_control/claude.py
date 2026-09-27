@@ -330,6 +330,12 @@ class ClaudeTurn:
                     if self._stopping:
                         out.status = "stopped"
                         break
+                    if not msg.is_error and not msg.num_turns and not (msg.result or "").strip():
+                        # Resuming after a background task ended while no process was attached: Claude Code
+                        # first replays that notification as an empty turn. The answer to our message is still
+                        # to come - ending here killed Claude mid-work and the answer was lost.
+                        bg_emptied_at = time.monotonic()
+                        continue
                     if msg.is_error:
                         text = msg.result or " ".join(msg.errors or []) or msg.subtype
                         out.status, out.error = "error", humanize_error(text)
