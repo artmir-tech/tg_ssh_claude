@@ -48,6 +48,10 @@ class ActiveRun:
     activity: str = ""
     steps: int = 0
     background: int = 0
+    background_what: list[str] = field(default_factory=list)   # descriptions of the background tasks
+    current_turn: D.Turn | None = None  # the message Claude answers now (a follow-up sent while in background)
+    joined: list[int] = field(default_factory=list)            # follow-ups sent into this run
+    joining: bool = False
     waiting: str | None = None          # None | "approval" | "question"
     status_msg_id: int | None = None
     last_render: str = ""
@@ -190,8 +194,31 @@ class Manager:
             if turn is None:
                 break
             self._start(turn)
+        for ar in list(self.active.values()):   # Claude only waits for background work: the next message goes in now
+            if ar.claude and ar.claude.waiting_background and not ar.joining and not ar.stopping:
+                nxt = self.db.oldest_queued(ar.session_id)
+                if nxt:
+                    ar.joining = True
+                    self.db.update_turn(nxt.id, status="running", started_at=time.time())
+                    asyncio.get_running_loop().create_task(self._join(ar, nxt))
         for sid in self.db.queued_sessions_in_order():
             self._settle_status(sid)
+
+    async def _join(self, ar: ActiveRun, turn: D.Turn) -> None:
+        """Send a queued message into a run that only waits for background tasks (like typing in the CLI while
+        a background command runs). If that fails, the message stays queued for the next run."""
+        try:
+            if ar.claude and await ar.claude.send(turn.prompt):
+                ar.joined.append(turn.id)
+                ar.current_turn = turn
+                ar.activity = ""
+                self.set_status(ar.session_id, D.RUNNING)
+                log.info("turn %s sent into the running process of session %s (background tasks go on)",
+                         turn.id, ar.session_id)
+            else:
+                self.db.update_turn(turn.id, status="queued", started_at=None)
+        finally:
+            ar.joining = False
 
     def _start(self, turn: D.Turn) -> None:
         ar = ActiveRun(session_id=turn.session_id, turn_id=turn.id, status_msg_id=turn.status_msg_id)
@@ -279,6 +306,8 @@ class Manager:
                 self.db.update_session(sid, started=1)
             self.db.update_turn(turn.id, status=outcome.status, finished_at=now, error=outcome.error,
                                 details=outcome.details, cost_usd=outcome.cost_usd, duration_ms=outcome.duration_ms)
+            for tid in ar.joined:   # follow-ups answered inside this run
+                self.db.update_turn(tid, status=outcome.status, finished_at=now, error=outcome.error)
             status = {"done": D.IDLE, "stopped": D.STOPPED}.get(outcome.status, D.ERROR)
             self.active.pop(sid, None)
             self.set_status(sid, status, current_pid=None, run_started_at=None, last_activity_at=now,
@@ -313,10 +342,13 @@ class Manager:
                         ar.written.append(path)
             elif kind == "background":
                 ar.background = d["count"]
+                ar.background_what = [x for x in d.get("what") or [] if x]
+                if ar.background and ar.claude and ar.claude.waiting_background and self.db.queued_count(ar.session_id):
+                    self.schedule()   # a message came while Claude was still answering: send it in now
             elif kind == "answer":
                 ar.answers_sent += 1
                 self.db.touch(ar.session_id)
-                await self.ui.deliver_answer(self.db.get_session(ar.session_id), turn, d["text"], ar)
+                await self.ui.deliver_answer(self.db.get_session(ar.session_id), ar.current_turn or turn, d["text"], ar)
                 await self._flush_files(ar)
             elif kind == "rate_limit":
                 info = d["info"]

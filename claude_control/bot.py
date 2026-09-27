@@ -1110,6 +1110,10 @@ class Bot:
     async def _queue_notice(self, s: D.Session, turn: D.Turn) -> None:
         if s.id in self.m.active and self.m.active[s.id].turn_id == turn.id:
             return  # started right away; run_started() shows progress
+        fresh = self.db.get_turn(turn.id)
+        if s.id in self.m.active and fresh and fresh.status == "running":   # sent into a run waiting for background work
+            await self.notice(s.topic_id, "📨 Передал Claude — ответит сейчас. Фоновая задача продолжает работать.")
+            return
         if s.id in self.m.busy_elsewhere():
             text = ("💻 Эта сессия сейчас работает в VS Code.\n"
                     "Выполню ваше сообщение, когда она там освободится.")
@@ -1551,8 +1555,14 @@ class Bot:
             head = f"❓ Claude спрашивает ↓ · {elapsed}"
         elif ar.stopping:
             head = "⏹ Останавливаю…"
-        elif ar.background and ar.answers_sent:
-            head = f"⏳ Фоновые задачи: {ar.background} · {elapsed}"
+        elif ar.background and ar.answers_sent and not (ar.claude and ar.claude.turn_open):
+            what = "; ".join(ar.background_what) if ar.background_what else ""
+            head = (f"⏳ Claude ждёт фоновую задачу · {elapsed}" if ar.background == 1
+                    else f"⏳ Claude ждёт фоновые задачи ({ar.background}) · {elapsed}")
+            lines = [head] + ([f"<code>{esc(clip(what, 60))}</code>"] if what else [])
+            lines += ["💬 Можно писать — Claude ответит сразу, задача продолжит работать.",
+                      "⏹ «Остановить» остановит и фоновую задачу."]
+            return "\n".join(lines)
         else:
             steps = f" · {plural(ar.steps, 'действие', 'действия', 'действий')}" if ar.steps >= 2 else ""
             head = f"⚙️ Работаю · {elapsed}{steps}"

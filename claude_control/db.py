@@ -287,6 +287,10 @@ class Registry:
             """SELECT session_id FROM turns WHERE status='queued'
                GROUP BY session_id ORDER BY MIN(id)""")]
 
+    def oldest_queued(self, session_id: int) -> Turn | None:
+        return _build(Turn, self.conn.execute(
+            "SELECT * FROM turns WHERE session_id=? AND status='queued' ORDER BY id LIMIT 1", (session_id,)).fetchone())
+
     def queued_count(self, session_id: int) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM turns WHERE session_id=? AND status='queued'",
                                  (session_id,)).fetchone()[0]

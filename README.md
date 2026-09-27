@@ -315,6 +315,9 @@ Telegram (long polling) ─> bot.py ─> manager.py ─> claude.py ─> claude C
 - **Видимость в `claude --resume` и VS Code.** CLI скрывает сессии с меткой `sdk-*`, поэтому ходы запускаются с
   `CLAUDE_CODE_ENTRYPOINT=claude-control`, а сообщение пользователя помечается `origin: {"kind": "human"}`.
 - **Фоновые задачи.** Если Claude уводит работу в фон, ход остаётся подключённым до её окончания и ответа Claude.
+  Пока он только ждёт фон (`ClaudeTurn.waiting_background`), новое сообщение темы не стоит в очереди: `Manager._join`
+  отправляет его в тот же процесс (`client.query`), как ввод в CLI во время фоновой команды. «Остановить» прерывает
+  ответ (`interrupt`) и останавливает фоновые задачи (`stop_task`); не завершившийся за 20 с процесс завершается.
 - **Разрешения.** `permission_mode` сессии: `sessions.permission_mode` (пусто = `PERMISSION_MODE` из `.env`) →
   `ClaudeAgentOptions.permission_mode`; всё, что Claude Code решил спросить, приходит в `can_use_tool` → кнопки.
   Смена режима во время работы — `ClaudeSDKClient.set_permission_mode()` (кнопка «🤖 Разрешить и включить Авто»
@@ -373,7 +376,7 @@ env -i HOME=$HOME PATH=/usr/bin:/bin LANG=C.UTF-8 .venv/bin/python -m tests.acce
 env -i HOME=$HOME PATH=/usr/bin:/bin LANG=C.UTF-8 .venv/bin/python -m tests.acceptance T1 T9   # выборочно
 ```
 
-21 сценарий: новая сессия, продолжение, изоляция, 5 параллельных задач и очередь, очередь внутри сессии,
+23 сценария: новая сессия, продолжение, изоляция, 5 параллельных задач и очередь, очередь внутри сессии,
 перезапуск службы, чужой пользователь, остановка, совместимость с `claude --resume`, ошибка и «Повторить»,
 кнопки разрешений и вопросов, импорт/ветка/переименование/архив/файлы, VS Code и лимиты, дашборд,
 панель темы, чистота General, голосовое → расшифровка → Claude и видео → инструмент `transcribe` (если установлен голос), файлы в обе стороны, режимы разрешений (Авто — на Sonnet), сообщение из General → тема.

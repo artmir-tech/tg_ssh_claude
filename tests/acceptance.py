@@ -974,14 +974,16 @@ async def t22_transcribe_tool(h: Harness, ctx: dict) -> str:
         topic = await h.new_topic("Test T — transcribe")
         s = h.m.create_session(CHAT, topic, "Test T — transcribe", cwd=str(tdir))
         CREATED_SESSIONS.add(s.claude_session_id)
-        await h.say(topic, "Use your transcribe tool on meeting.mp4 with timestamps. Then reply with the first four "
+        await h.say(topic, "Use your MCP tool mcp__claude_control__transcribe (not a shell command) on meeting.mp4 "
+                           "with timestamps. Then reply with the first four "
                            "words of the transcript and nothing else.")
         turn = await h.wait_idle(topic, 240)
         out = tdir / "meeting.расшифровка.txt"
         check(out.exists(), f"transcript saved next to the video: {sorted(x.name for x in tdir.iterdir())}")
         text = out.read_text()
         check("Ничьих не требуя похвал" in text and text.startswith("[00:00-"), f"GigaAM text with timestamps: {text[:80]!r}")
-        check(not [m for m in h.tg.in_topic(topic) if m["text"].startswith("🔐")], "no permission request needed")
+        asked = [m["text"][:160] for m in h.tg.in_topic(topic) if m["text"].startswith("🔐")]
+        check(not asked, f"no permission request needed: {asked}")
         answers = h.answers(topic)
         check(turn.status == "done" and answers and "похвал" in answers[-1].lower(), f"Claude used it: {answers[-1:]}")
         check(out.name not in [f for m in h.tg.in_topic(topic) for f in m.get("files", [])],
@@ -999,6 +1001,31 @@ async def t22_transcribe_tool(h: Harness, ctx: dict) -> str:
     return f"video → transcribe tool (no approval) → {out.name}: «{text[:60]}…»; Claude answered «{answers[-1][:40]}»"
 
 
+async def t23_background(h: Harness, ctx: dict) -> str:
+    marker = f"sleep {300 + os.getpid() % 97}"   # unique, to find the background process
+    alive = lambda: subprocess.run(["pgrep", "-f", marker], capture_output=True).returncode == 0  # noqa: E731
+    topic = await h.new_topic("Test B — background")
+    await h.say(topic, f"Use the Bash tool with run_in_background=true to run: {marker} && echo BG-DONE . "
+                       "Do not wait for it and do not check on it. Reply exactly: STARTED")
+    s = lambda: h.session(topic)  # noqa: E731
+    await h.wait(lambda: s().id in h.m.active and h.m.active[s().id].background and h.m.active[s().id].answers_sent,
+                 120, "Claude answered and waits for the background task")
+    ar = h.m.active[s().id]
+    check(alive() and "ждёт фоновую задачу" in h.bot._status_text(s(), ar), "status says it waits for background work")
+    await h.say(topic, "Reply exactly: PONG")
+    await h.wait(lambda: any("PONG" in a for a in h.answers(topic)), 60, "answer to a message sent while waiting")
+    check(s().id in h.m.active and alive(), "answered at once, the background task goes on")
+    check(any(m["text"].startswith("📨 Передал Claude") for m in h.tg.in_topic(topic)), "the owner is told it went in now")
+    t0 = time.time()
+    await h.press(f"stop:{s().id}", thread=topic)
+    await h.wait_idle(topic, 40)
+    took = time.time() - t0
+    check(took < 8 and s().status == D.STOPPED, f"«Остановить» works at once while waiting ({took:.1f}s)")
+    await asyncio.sleep(1)
+    check(not alive(), "the background task was stopped too")
+    return f"message while waiting answered at once (background went on); Stop ended the wait in {took:.1f}s"
+
+
 TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T3", "isolation", t3_isolation),
          ("T4+T5", "concurrency=5 + queue", t4_t5_concurrency_and_queue),
          ("T6", "same-session serialization", t6_serialization), ("T7", "service restart", t7_restart),
@@ -1014,7 +1041,8 @@ TESTS = [("T1", "new session", t1_new_session), ("T2", "resume", t2_resume), ("T
          ("T19", "files: Claude → chat automatically, send_file, albums, limits", t19_files),
          ("T20", "permission modes: Auto by default, picker, switch from a request", t20_permission_modes),
          ("T21", "message in General → «Куда отправить?» → topic", t21_general_route),
-         ("T22", "transcribe tool: audio/video file → GigaAM → Claude", t22_transcribe_tool)]
+         ("T22", "transcribe tool: audio/video file → GigaAM → Claude", t22_transcribe_tool),
+         ("T23", "background task: talk while waiting, Stop works", t23_background)]
 
 
 async def main(selected: list[str]) -> int:

@@ -39,6 +39,7 @@ warnings.filterwarnings("ignore", category=CanUseToolShadowedWarning)
 
 ENTRYPOINT = "claude-control"
 BG_CONTINUATION_GRACE_S = 90  # after background tasks finish, wait this long for Claude's follow-up turn
+STOP_GRACE_S = 20             # «Остановить»: if the process has not finished by then, it is terminated
 
 EventCallback = Callable[..., Awaitable[None]]
 PermissionCallback = Callable[[str, dict, ToolPermissionContext], Awaitable[Any]]
@@ -137,6 +138,9 @@ class ClaudeTurn:
         self._stderr: list[str] = []
         self._client: ClaudeSDKClient | None = None
         self._stopping = False
+        self._turn_open = False           # Claude is answering (a ResultMessage will follow)
+        self._bg_tasks: list[dict] = []   # background tasks Claude started (Bash run_in_background, agents)
+        self._stop_job: asyncio.Task | None = None
         self.options = ClaudeAgentOptions(
             cli_path=cli_path,
             cwd=cwd,
@@ -174,16 +178,61 @@ class ClaudeTurn:
             log.warning("set_permission_mode failed: %s", type(e).__name__)
             return False
 
+    @property
+    def waiting_background(self) -> bool:
+        """Claude has answered and only waits for its background tasks: a new message can go in at once."""
+        return self._client is not None and not self._stopping and not self._turn_open and bool(self._bg_tasks)
+
+    @property
+    def turn_open(self) -> bool:
+        return self._turn_open
+
+    async def send(self, prompt: str) -> bool:
+        """A follow-up message into the running process while background tasks go on (as typing in the CLI)."""
+        client = self._client
+        if client is None or not self.waiting_background:
+            return False
+        self._turn_open = True
+
+        async def message():
+            yield {"type": "user", "message": {"role": "user", "content": prompt},
+                   "parent_tool_use_id": None, "origin": {"kind": "human"}}
+        try:
+            await asyncio.wait_for(client.query(message()), 10)
+            return True
+        except Exception as e:  # noqa: BLE001 - it stays queued and runs after this process
+            self._turn_open = False
+            log.warning("follow-up into a running process failed: %s", type(e).__name__)
+            return False
+
     async def stop(self) -> None:
-        """Interrupt the current turn. History stays intact (verified: resume works after)."""
+        """Stop everything this process does: the current answer and the background tasks it waits for.
+        History stays intact (verified: resume works after). A process that does not end in time is
+        terminated - «Остановить» must always work."""
         self._stopping = True
         client = self._client
         if client is None:
             return
+        loop = asyncio.get_running_loop()
+        loop.call_later(STOP_GRACE_S, self._kill_if_running, client)
+        # Not awaited: the process often ends before it confirms, and the button must answer at once.
+        self._stop_job = loop.create_task(self._send_stop(client))
+
+    async def _send_stop(self, client: ClaudeSDKClient) -> None:
         try:
-            await asyncio.wait_for(client.interrupt(), 10)
+            if self._turn_open or not self._bg_tasks:
+                await asyncio.wait_for(client.interrupt(), 10)
+            for task in list(self._bg_tasks):
+                if task.get("task_id"):
+                    await asyncio.wait_for(client.stop_task(task["task_id"]), 10)
         except Exception as e:  # noqa: BLE001
-            log.warning("interrupt failed (%s); terminating process", type(e).__name__)
+            if self._client is client:   # still running and not answering: end it
+                log.warning("stop failed (%s); terminating process", type(e).__name__)
+                self._kill()
+
+    def _kill_if_running(self, client: ClaudeSDKClient) -> None:
+        if self._client is client:
+            log.warning("process did not stop in %ss; terminating it", STOP_GRACE_S)
             self._kill()
 
     def _kill(self) -> None:
@@ -236,13 +285,15 @@ class ClaudeTurn:
                        "parent_tool_use_id": None, "origin": {"kind": "human"}}
             await client.query(message())
 
-            bg_tasks: list = []
-            turn_open = True           # a turn is in progress (a ResultMessage will follow)
+            self._turn_open = True
             bg_emptied_at: float | None = None
             stream = client.receive_messages().__aiter__()
             while True:
+                if self._stopping and not self._turn_open and not self._bg_tasks:
+                    out.status = "stopped"
+                    break
                 timeout = None
-                if not turn_open and not bg_tasks:
+                if not self._turn_open and not self._bg_tasks:
                     # Background work finished; Claude normally starts a follow-up turn at once.
                     timeout = max(0.1, BG_CONTINUATION_GRACE_S - (time.monotonic() - (bg_emptied_at or 0)))
                 try:
@@ -251,17 +302,18 @@ class ClaudeTurn:
                     break
                 if isinstance(msg, SystemMessage):
                     if msg.subtype == "init":
-                        turn_open = True
+                        self._turn_open = True
                         out.session_seen = msg.data.get("session_id")
                         out.transcript_started = True
                         if out.session_seen and out.session_seen != self.claude_session_id:
                             log.error("session id mismatch: expected %s got %s",
                                       self.claude_session_id[:8], out.session_seen[:8])
                     elif msg.subtype == "background_tasks_changed":
-                        bg_tasks = list(msg.data.get("tasks") or [])
-                        if not bg_tasks:
+                        self._bg_tasks = list(msg.data.get("tasks") or [])
+                        if not self._bg_tasks:
                             bg_emptied_at = time.monotonic()
-                        await self.on_event("background", count=len(bg_tasks))
+                        await self.on_event("background", count=len(self._bg_tasks),
+                                            what=[t.get("description") or "" for t in self._bg_tasks])
                 elif isinstance(msg, AssistantMessage):
                     for block in msg.content:
                         if isinstance(block, ToolUseBlock):
@@ -272,7 +324,7 @@ class ClaudeTurn:
                 elif isinstance(msg, RateLimitEvent):
                     await self.on_event("rate_limit", info=msg.rate_limit_info)
                 elif isinstance(msg, ResultMessage):
-                    turn_open = False
+                    self._turn_open = False
                     if msg.total_cost_usd is not None:
                         out.cost_usd = msg.total_cost_usd  # cumulative for this process
                     if self._stopping:
@@ -287,9 +339,10 @@ class ClaudeTurn:
                     answer = (msg.result or out.last_text or "").strip()
                     out.answers.append(answer)
                     await self.on_event("answer", text=answer)
-                    if not bg_tasks:
+                    if not self._bg_tasks:
                         break
-                    await self.on_event("background", count=len(bg_tasks))
+                    await self.on_event("background", count=len(self._bg_tasks),
+                                        what=[t.get("description") or "" for t in self._bg_tasks])
 
 
 def build_permission_result(decision: str, ctx: ToolPermissionContext, message: str = "") -> Any:
